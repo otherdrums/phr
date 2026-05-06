@@ -125,7 +125,7 @@ def build_phr():
             {"params": phr_params, "lr": 2e-5},
             {"params": head_params, "lr": 1e-3},
         ],
-        betas=(0.0, 0.999),
+        betas=(0.9, 0.999),
     )
     return model, optimizer
 

@@ -25,8 +25,11 @@ from .configs import METHODS, build_optimizer, count_trainable
 from .training import train_one_epoch, evaluate
 from .memory_tracker import MemoryTracker, gpu_used_mb
 
+from datetime import datetime
+
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
+RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def _save_model(model, method_key, metrics, idle_vram):
@@ -34,7 +37,7 @@ def _save_model(model, method_key, metrics, idle_vram):
     import json
     from phr import PHRLinear
 
-    out_dir = os.path.join(RESULTS_DIR, f"sst2_{method_key}_seed42")
+    out_dir = os.path.join(RESULTS_DIR, f"sst2_{method_key}_seed42_{RUN_ID}")
     os.makedirs(out_dir, exist_ok=True)
 
     # Save state dict
