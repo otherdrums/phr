@@ -247,4 +247,12 @@ python harness.py --epochs=3         # Custom epoch count
 
 ## License
 
-[Your license here]
+PHR is licensed under the **GNU Affero General Public License v3.0 (AGPLv3)**.
+See [LICENSE](LICENSE) for the full text.
+
+This license ensures that all modifications and network-facing deployments of
+PHR remain open source. If you use PHR in a commercial context — including
+as a hosted service — you must make your changes available to users.
+
+For commercial licensing terms outside the scope of the AGPLv3, contact the
+project maintainers.
