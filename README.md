@@ -115,6 +115,23 @@ PHR decomposes a weight matrix into three components:
 
 Forward pass: `out = x @ (W_f + lut[W_p])`
 
+**Fused decode — no weight matrix materialized.** Standard quantization
+approaches materialize the full-precision weight matrix before the matmul
+(e.g., `W_fp32 = dequantize(W_int8)` — a `[K,N]` fp32 tensor). PHR uses a
+CUDA decode kernel that fuses the LUT lookup directly into the matmul
+pipeline: `lut[W_p]` is computed on-the-fly as a `[K,N]` fp16 intermediate
+(~0.2ms for 2M elements) and summed with `W_f` into fp32, then fed to
+cuBLAS. The temporary fp16 decode buffer is freed immediately after the
+matmul. This avoids a persistent `[K,N]` fp32 weight allocation — saving
+**4 bytes/weight** of VRAM compared to materializing the full matrix, and
+**1 byte/weight** vs storing fp16 weights directly.
+
+| Representation | Persistent VRAM per weight | vs PHR |
+|---------------|:-------------------------:|:------:|
+| Standard fp32 | 4 bytes | +25% |
+| Standard fp16 | 2 bytes | −33% (but no gradient on the quantization) |
+| PHR (ours) | 3 bytes | — |
+
 The codebook uses a multiplicative nibble encoding:
 - Lower nibble: gain ∈ [-1.0, 1.0]
 - Upper nibble: scale ∈ [0.1, 1.6]
