@@ -1,0 +1,41 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv*/
+venv*/
+env/
+
+# Results and training artifacts
+results/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Analysis and planning docs
+analysis.txt
+analysis*.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Distribution
+dist/
+build/
+*.egg-info/
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# CUDA build artifacts
+*.so
+*.o
+low_ram_toolset/
