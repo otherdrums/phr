@@ -1,5 +1,10 @@
 # PHR — Packed Hybrid Residual
 
+> **Warning:** PHR is under active development and **not yet ready for drop-in
+> use.** APIs, training dynamics, and file formats are subject to change without
+> notice. Expect breakage, improvement, and iteration. Production use is at your
+> own risk until a stable release is tagged.
+
 Memory-efficient neural network training and inference using packed 8-bit
 codebook-indexed weights with learnable residuals.
 
