@@ -53,7 +53,7 @@ python -c "import triton; print(triton.__version__)"  # Triton version
 ## Installation
 
 ```bash
-git clone https://github.com/your-org/phr.git
+git clone https://github.com/otherdrums/phr.git
 cd phr
 pip install -r requirements.txt
 ```

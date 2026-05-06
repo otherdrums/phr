@@ -25,7 +25,7 @@ constitutes acceptance of this agreement.
 ## Development Setup
 
 ```bash
-git clone https://github.com/your-org/phr.git
+git clone https://github.com/otherdrums/phr.git
 cd phr
 python -m venv .venv
 source .venv/bin/activate
