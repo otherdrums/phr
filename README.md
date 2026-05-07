@@ -41,12 +41,13 @@ This requires:
 The `FusedQuantizedAdam` optimizer uses **Triton 2.1+**, which requires a
 CUDA-capable GPU with compute capability 7.0+ (Volta or newer).
 
-> **Note:** Triton kernels compile to tensor core instructions (`wmma`/`mma`)
-> on supported hardware (compute capability 7.0+ Volta, 7.5+ Turing with tensor
-> cores). On GPUs without tensor cores — such as the GTX 1650 (TU117) — Triton
-> falls back to CUDA core SIMT instructions. The kernel runs correctly but at
-> reduced throughput. Because the author's hardware lacks tensor cores, the
-> optimizer's full speedup cannot be benchmarked yet.
+> **Note:** Triton compiles to tensor core instructions on supported hardware
+> (Volta+, Turing 7.5+ with tensor cores). On GPUs without tensor cores —
+> such as the GTX 1650 (TU117) — Triton falls back to a CUDA core SIMT
+> compilation path. The kernel runs and is believed to be faster than the
+> equivalent naive CUDA kernel due to Triton's block-level scheduling, but
+> the full tensor-core speedup has not been benchmarked because the author's
+> hardware lacks tensor cores.
 
 ### Quick CUDA check
 
