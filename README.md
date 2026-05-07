@@ -28,26 +28,36 @@ codebook-indexed weights with learnable residuals.
 
 ### CUDA Dependencies
 
-The decode kernel is JIT-compiled at import time via `torch.utils.cpp_extension.load_inline`.
-This requires:
+PHR uses two separate CUDA compilation paths:
 
-| Component | Minimum Version | Notes |
-|-----------|:--------------:|-------|
-| CUDA Toolkit | 12.x | `nvcc` must be on `PATH` |
-| cuBLAS | — | Included with PyTorch CUDA wheel |
-| cuDNN | — | Included with PyTorch CUDA wheel |
-| GPU driver | 525+ | For CUDA 12.x compatibility |
+| Kernel | Purpose | Compiler | Needs tensor cores? |
+|--------|---------|----------|:---:|
+| `decode_packed_cuda` | LUT lookup (`lut[W_p]`) | nvcc via `load_inline` | No |
+| `_fused_adam_8bit_kernel` | 8-bit AdamW optimizer | Triton `@triton.jit` | No (but helps) |
 
-The `FusedQuantizedAdam` optimizer uses **Triton 2.1+**, which requires a
-CUDA-capable GPU with compute capability 7.0+ (Volta or newer).
+**Decode kernel** (`kernel.py`): Raw CUDA C++ source is injected into Python at
+import time via `torch.utils.cpp_extension.load_inline` and compiled with nvcc.
+This kernel runs on any CUDA GPU and uses `--use_fast_math` for throughput.
+Requires `nvcc` on `PATH`.
 
-> **Note:** Triton compiles to tensor core instructions on supported hardware
-> (Volta+, Turing 7.5+ with tensor cores). On GPUs without tensor cores —
-> such as the GTX 1650 (TU117) — Triton falls back to a CUDA core SIMT
-> compilation path. The kernel runs and is believed to be faster than the
-> equivalent naive CUDA kernel due to Triton's block-level scheduling, but
-> the full tensor-core speedup has not been benchmarked because the author's
-> hardware lacks tensor cores.
+| Component | Minimum Version |
+|-----------|:--------------:|
+| CUDA Toolkit | 12.x |
+| cuBLAS | Included with PyTorch CUDA wheel |
+| GPU driver | 525+ |
+
+**Optimizer kernel** (`optim.py`): Triton `@triton.jit` kernel compiled to the
+target GPU's instruction set. On hardware with tensor cores (Volta+, Turing 7.5+)
+Triton emits `wmma`/`mma` instructions. On GPUs without tensor cores — such as
+the GTX 1650 (TU117) — Triton falls back to a CUDA core SIMT compilation path.
+Both paths are the same Python kernel; only the generated PTX differs.
+
+> The optimizer's full tensor-core throughput has not been benchmarked because
+> the author's hardware lacks tensor cores. The SIMT path is functional and
+> believed to benefit from Triton's block-level scheduling, but measurements
+> on tensor-core hardware are needed to characterize the designed speedup.
+
+Requires `triton>=2.1.0` and a CUDA-capable GPU with compute capability 7.0+.
 
 ### Quick CUDA check
 
