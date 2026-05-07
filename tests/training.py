@@ -18,6 +18,7 @@ def train_one_epoch(
     val_steps=100,
     tracker=None,
     criterion=None,
+    scheduler=None,
 ):
     if criterion is None:
         criterion = nn.CrossEntropyLoss()
@@ -48,6 +49,8 @@ def train_one_epoch(
 
         if (batch_idx + 1) % acc_steps == 0:
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             optimizer.zero_grad()
             tracker.step()
 
@@ -71,6 +74,8 @@ def train_one_epoch(
 
     if (batch_idx + 1) % acc_steps != 0:
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         optimizer.zero_grad()
         tracker.step()
 
