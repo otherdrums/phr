@@ -12,7 +12,8 @@ codebook-indexed weights with learnable residuals.
 
 - **37% VRAM reduction** vs full fine-tune (1.7 GB vs 2.7 GB on BERT-base, batch=8)
 - **3 bytes/weight** persistent storage (uint8 indices + bf16 residual + 256-entry LUT)
-- **8-bit AdamW optimizer** via Triton — int8 m/v moments save 6 bytes per trainable param
+- **8-bit AdamW optimizer** (`FusedQuantizedAdam`) via Triton — int8 m/v moments save 6 bytes per trainable param, with full β₁=0.9 momentum matching standard AdamW
+- **3-phase LR schedule** — linear warmup → constant hold → cosine decay, with differential LR for body (2e-5) vs classification head (1e-3)
 - **Learnable 256-entry codebook** with multiplicative nibble encoding
 - **Fused CUDA decode kernel** — no persistent full-precision weight matrix materialized
 - **Drop-in replacement** for `nn.Linear` in any HuggingFace model
@@ -89,7 +90,10 @@ with `pip install -e .`.
 
 ```python
 from transformers import AutoModelForSequenceClassification
-from phr import compress_model, PHRConfig
+from phr import compress_model, PHRConfig, FusedQuantizedAdam
+from torch.optim.lr_scheduler import (
+    LinearLR, SequentialLR, CosineAnnealingLR
+)
 
 config = PHRConfig(
     scheme="phr",
@@ -104,8 +108,41 @@ model = AutoModelForSequenceClassification.from_pretrained(
 model = compress_model(model, config)
 model.cuda()
 
-# Train normally with standard PyTorch / HuggingFace training loop
-optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
+# Differential LR: head gets 50x higher LR than body
+head_params = [p for n, p in model.named_parameters()
+               if "classifier" in n or "cls" in n]
+body_params = [p for n, p in model.named_parameters()
+               if p.requires_grad and "classifier" not in n and "cls" not in n]
+
+optimizer = FusedQuantizedAdam(
+    [
+        {"params": body_params, "lr": 2e-5},
+        {"params": head_params, "lr": 1e-3},
+    ],
+    betas=(0.9, 0.999),   # full momentum matching standard AdamW
+)
+
+# 3-phase LR schedule: warmup → hold → cosine decay
+warmup_steps = 200
+hold_start = int(0.6 * 10000)  # decay starts at 60% of training
+scheduler = SequentialLR(
+    optimizer,
+    schedulers=[
+        LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps),
+        LinearLR(optimizer, start_factor=1.0, end_factor=1.0,
+                 total_iters=hold_start - warmup_steps),
+        CosineAnnealingLR(optimizer, T_max=10000 - hold_start, eta_min=0.1),
+    ],
+    milestones=[warmup_steps, hold_start],
+)
+
+# Train with scheduler.step() after each optimizer.step()
+for batch in train_loader:
+    loss = model(**batch).loss
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad()
 ```
 
 ## File Structure
@@ -124,7 +161,7 @@ phr/
 │   ├── configs.py           # Method builders (PHR, LoRA, QLoRA, full, BitFit)
 │   ├── harness.py           # Unified SST-2 comparison harness
 │   ├── training.py          # Training/eval loop
-│   └── memory_tracker.py    # GPU VRAM tracking via pynvml
+│   └── memory_tracker.py    # GPU VRAM tracking via nvidia-ml-py
 ├── requirements.txt
 └── README.md
 ```
@@ -204,7 +241,7 @@ PHR and LoRA-family methods address the VRAM problem from opposite directions:
 |---|:---:|:----------:|:-------------:|
 | Trainable params | ~82M | ~0.6M | ~0.6M |
 | Peak VRAM | ~1.7 GB | ~1.1 GB | ~0.6 GB |
-| SST-2 accuracy | ~92.5% | ~91.5% | ~91.0% |
+| SST-2 accuracy | ~92.4% | ~91.5% | ~91.0% |
 | Approach | Compress storage of **full** training | Train a **low-rank** adapter | Quantize base + **low-rank** adapter |
 | Base model | Replaced with PHR layers | Frozen | Frozen + NF4 quantized |
 | Gradient signal | Full weight matrix + codebook | Adapter matrices only | Adapter matrices only |
