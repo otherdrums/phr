@@ -58,13 +58,13 @@ def _fused_adam_8bit_kernel(
 
     m_absmax = tl.max(tl.abs(m_new))
     v_absmax = tl.max(tl.abs(v_new))
-    new_m_scale = tl.maximum(m_absmax / 127.0, 1e-10)
-    new_v_scale = tl.maximum(v_absmax / 127.0, 1e-10)
+    new_m_scale = tl.maximum(m_absmax / 127.0, 1e-14)
+    new_v_scale = tl.maximum(v_absmax / 127.0, 1e-14)
 
-    m_i8_new = (m_new / new_m_scale + 0.5).to(tl.int32)
-    m_i8_new = tl.minimum(tl.maximum(m_i8_new, -127), 127)
-    v_i8_new = (v_new / new_v_scale + 0.5).to(tl.int32)
-    v_i8_new = tl.minimum(tl.maximum(v_i8_new, 0), 127)
+    m_rounded = tl.where(m_new >= 0.0, m_new / new_m_scale + 0.5, m_new / new_m_scale - 0.5).to(tl.int32)
+    m_i8_new = tl.minimum(tl.maximum(m_rounded, -127), 127)
+    v_rounded = (v_new / new_v_scale + 0.5).to(tl.int32)
+    v_i8_new = tl.minimum(tl.maximum(v_rounded, 0), 127)
 
     m_hat = m_new / bias_correction1
     v_hat = v_new / bias_correction2
