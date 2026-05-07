@@ -221,11 +221,6 @@ full fine-tune — with momentum β₁=0.9 now enabled (matching full fine-tune'
 β₁), plus scheduler tuning and progressive unfreezing as further improvement
 paths — while keeping the model 25% smaller than fp32.
 
-PHR is the right choice when:
-- You need the model to adapt broadly (not just along a low-rank subspace)
-- You want the final model compact for inference (3 bytes/weight, no merge step)
-- You lack calibration data or want to avoid NF4 quantization complexity
-
 ## Testing
 
 Run the SST-2 comparison harness:
