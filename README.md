@@ -13,7 +13,7 @@ codebook-indexed weights with learnable residuals.
 - **37% VRAM reduction** vs full fine-tune (1.7 GB vs 2.7 GB on BERT-base, batch=8)
 - **3 bytes/weight** persistent storage (uint8 indices + bf16 residual + 256-entry LUT)
 - **8-bit AdamW optimizer** (`FusedQuantizedAdam`) via Triton — int8 m/v moments save 6 bytes per trainable param, with full β₁=0.9 momentum matching standard AdamW
-- **3-phase LR schedule** — linear warmup → constant hold → cosine decay, with differential LR for body (2e-5) vs classification head (1e-3)
+- **3-phase LR schedule** — linear warmup → constant hold → linear decay, with differential LR for body (2e-5) vs classification head (1e-3)
 - **Learnable 256-entry codebook** with multiplicative nibble encoding
 - **Fused CUDA decode kernel** — no persistent full-precision weight matrix materialized
 - **Drop-in replacement** for `nn.Linear` in any HuggingFace model
@@ -92,7 +92,7 @@ with `pip install -e .`.
 from transformers import AutoModelForSequenceClassification
 from phr import compress_model, PHRConfig, FusedQuantizedAdam
 from torch.optim.lr_scheduler import (
-    LinearLR, SequentialLR, CosineAnnealingLR
+    LinearLR, SequentialLR
 )
 
 config = PHRConfig(
@@ -122,7 +122,7 @@ optimizer = FusedQuantizedAdam(
     betas=(0.9, 0.999),   # full momentum matching standard AdamW
 )
 
-# 3-phase LR schedule: warmup → hold → cosine decay
+# 3-phase LR schedule: warmup → hold → linear decay
 total_steps = len(train_loader) * num_epochs
 warmup_steps = int(0.02 * total_steps)     # 2% warmup
 hold_start = int(0.60 * total_steps)       # decay starts at 60%
@@ -132,7 +132,8 @@ scheduler = SequentialLR(
         LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps),
         LinearLR(optimizer, start_factor=1.0, end_factor=1.0,
                  total_iters=hold_start - warmup_steps),
-        CosineAnnealingLR(optimizer, T_max=total_steps - hold_start, eta_min=0.1),
+        LinearLR(optimizer, start_factor=1.0, end_factor=0.1,
+                 total_iters=total_steps - hold_start),
     ],
     milestones=[warmup_steps, hold_start],
 )

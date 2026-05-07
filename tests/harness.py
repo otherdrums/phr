@@ -26,7 +26,7 @@ from .configs import METHODS, build_optimizer, count_trainable
 from .training import train_one_epoch, evaluate
 from .memory_tracker import MemoryTracker, gpu_used_mb
 from .training_config import TrainingConfig
-from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR
+from torch.optim.lr_scheduler import LinearLR, SequentialLR
 
 from datetime import datetime
 
@@ -211,7 +211,7 @@ def run(quick=False, method_filter=None, epochs=5):
                 schedulers=[
                     LinearLR(optimizer, start_factor=cfg.warmup_start_factor, end_factor=1.0, total_iters=warmup_steps),
                     LinearLR(optimizer, start_factor=1.0, end_factor=1.0, total_iters=hold_start - warmup_steps),
-                    CosineAnnealingLR(optimizer, T_max=total_micro_steps - hold_start, eta_min=cfg.decay_eta_min),
+                    LinearLR(optimizer, start_factor=1.0, end_factor=cfg.decay_eta_min, total_iters=total_micro_steps - hold_start),
                 ],
                 milestones=[warmup_steps, hold_start],
             )
