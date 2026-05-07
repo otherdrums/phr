@@ -123,26 +123,28 @@ optimizer = FusedQuantizedAdam(
 )
 
 # 3-phase LR schedule: warmup → hold → cosine decay
-warmup_steps = 200
-hold_start = int(0.6 * 10000)  # decay starts at 60% of training
+total_steps = len(train_loader) * num_epochs
+warmup_steps = int(0.02 * total_steps)     # 2% warmup
+hold_start = int(0.60 * total_steps)       # decay starts at 60%
 scheduler = SequentialLR(
     optimizer,
     schedulers=[
         LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps),
         LinearLR(optimizer, start_factor=1.0, end_factor=1.0,
                  total_iters=hold_start - warmup_steps),
-        CosineAnnealingLR(optimizer, T_max=10000 - hold_start, eta_min=0.1),
+        CosineAnnealingLR(optimizer, T_max=total_steps - hold_start, eta_min=0.1),
     ],
     milestones=[warmup_steps, hold_start],
 )
 
-# Train with scheduler.step() after each optimizer.step()
+# Step scheduler at micro-batch granularity for smooth cosine
 for batch in train_loader:
     loss = model(**batch).loss
     loss.backward()
-    optimizer.step()
-    scheduler.step()
-    optimizer.zero_grad()
+    scheduler.step()                       # per micro-batch
+    if (batch_idx + 1) % acc_steps == 0:
+        optimizer.step()
+        optimizer.zero_grad()
 ```
 
 ## File Structure
@@ -159,6 +161,7 @@ phr/
 │   └── optim.py             # FusedQuantizedAdam (Triton 8-bit AdamW)
 ├── tests/
 │   ├── configs.py           # Method builders (PHR, LoRA, QLoRA, full, BitFit)
+│   ├── training_config.py   # TrainingConfig — single source of truth for hyperparams
 │   ├── harness.py           # Unified SST-2 comparison harness
 │   ├── training.py          # Training/eval loop
 │   └── memory_tracker.py    # GPU VRAM tracking via nvidia-ml-py

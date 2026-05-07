@@ -13,6 +13,7 @@ os.environ["DATASETS_VERBOSITY"] = "error"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
+import subprocess
 from contextlib import redirect_stderr
 from torch.utils.data import DataLoader
 from transformers import BertTokenizerFast
@@ -24,13 +25,18 @@ datasets.disable_progress_bar()
 from .configs import METHODS, build_optimizer, count_trainable
 from .training import train_one_epoch, evaluate
 from .memory_tracker import MemoryTracker, gpu_used_mb
+from .training_config import TrainingConfig
 from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR
 
 from datetime import datetime
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
-RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
+_COMMIT = subprocess.check_output(
+    ["git", "rev-parse", "--short", "HEAD"],
+    cwd=os.path.dirname(os.path.dirname(__file__)),
+).decode().strip()
+RUN_ID = f"{_COMMIT}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 
 def _save_model(model, method_key, metrics, idle_vram):
@@ -124,6 +130,8 @@ def _cleanup():
 
 
 def run(quick=False, method_filter=None, epochs=5):
+    cfg = TrainingConfig(epochs=epochs)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     total_vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
     idle_vram = gpu_used_mb()
@@ -193,19 +201,17 @@ def run(quick=False, method_filter=None, epochs=5):
             print(f"  Params:      {trainable/1e6:.2f} M")
             print(f"  Model VRAM:  {model_vram:.0f} MB")
 
-            steps_per_epoch = (train_steps + ACC_STEPS - 1) // ACC_STEPS
-            total_opt_steps = steps_per_epoch * EPOCHS
-            warmup_steps = min(total_opt_steps // 20, 200)
-            hold_start = int(0.6 * total_opt_steps)
-            hold_steps = hold_start - warmup_steps
-            decay_steps = total_opt_steps - hold_start
+            steps_per_epoch = len(train_loader)
+            total_micro_steps = steps_per_epoch * cfg.epochs
+            warmup_steps = int(cfg.warmup_fraction * total_micro_steps)
+            hold_start = int(cfg.hold_fraction * total_micro_steps)
 
             scheduler = SequentialLR(
                 optimizer,
                 schedulers=[
-                    LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps),
-                    LinearLR(optimizer, start_factor=1.0, end_factor=1.0, total_iters=hold_steps),
-                    CosineAnnealingLR(optimizer, T_max=decay_steps, eta_min=0.1),
+                    LinearLR(optimizer, start_factor=cfg.warmup_start_factor, end_factor=1.0, total_iters=warmup_steps),
+                    LinearLR(optimizer, start_factor=1.0, end_factor=1.0, total_iters=hold_start - warmup_steps),
+                    CosineAnnealingLR(optimizer, T_max=total_micro_steps - hold_start, eta_min=cfg.decay_eta_min),
                 ],
                 milestones=[warmup_steps, hold_start],
             )
@@ -300,6 +306,7 @@ def run(quick=False, method_filter=None, epochs=5):
                 "trainable_params_m": trainable / 1e6,
                 "total_time_s": total_time,
                 "epochs": EPOCHS,
+                "training_config": cfg.to_dict(),
             }, idle_vram)
 
         except torch.cuda.OutOfMemoryError as e:

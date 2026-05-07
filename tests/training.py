@@ -42,6 +42,8 @@ def train_one_epoch(
         outputs = model(input_ids=ids, attention_mask=mask)
         loss = criterion(outputs.logits, labels) / acc_steps
         loss.backward()
+        if scheduler is not None:
+            scheduler.step()
 
         total_loss += loss.item() * acc_steps
         correct += (outputs.logits.argmax(-1) == labels).sum().item()
@@ -49,8 +51,6 @@ def train_one_epoch(
 
         if (batch_idx + 1) % acc_steps == 0:
             optimizer.step()
-            if scheduler is not None:
-                scheduler.step()
             optimizer.zero_grad()
             tracker.step()
 
@@ -74,8 +74,6 @@ def train_one_epoch(
 
     if (batch_idx + 1) % acc_steps != 0:
         optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
         optimizer.zero_grad()
         tracker.step()
 

@@ -6,11 +6,13 @@ import torch.nn as nn
 from transformers import BertForSequenceClassification
 
 from phr import compress_model, PHRConfig, FusedQuantizedAdam
+from .training_config import TrainingConfig
 
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
 SHARED_SEED = 42
 _MODEL_KWARGS = {"local_files_only": True}
+_cfg = TrainingConfig()
 
 
 def build_full_finetune():
@@ -102,18 +104,17 @@ def build_phr():
         "bert-base-uncased", num_labels=2, ignore_mismatched_sizes=True,
         **_MODEL_KWARGS,
     )
-    config = PHRConfig(
-        scheme="phr",
-        layer_scope="ffn",
-        learnable_lut=True,
-        gradient_checkpointing=True,
+    phr_cfg = PHRConfig(
+        scheme=_cfg.scheme,
+        layer_scope=_cfg.layer_scope,
+        learnable_lut=_cfg.learnable_lut,
+        gradient_checkpointing=_cfg.gradient_checkpointing,
     )
-    model = compress_model(model, config)
+    model = compress_model(model, phr_cfg)
 
     # Separate params for differential LR
     head_params = []
     phr_params = []
-    other_params = []
     for n, p in model.named_parameters():
         if "classifier" in n or "cls" in n:
             head_params.append(p)
@@ -122,10 +123,13 @@ def build_phr():
 
     optimizer = FusedQuantizedAdam(
         [
-            {"params": phr_params, "lr": 2e-5},
-            {"params": head_params, "lr": 1e-3},
+            {"params": phr_params, "lr": _cfg.body_lr},
+            {"params": head_params, "lr": _cfg.head_lr},
         ],
-        betas=(0.9, 0.999),
+        betas=_cfg.betas,
+        eps=_cfg.eps,
+        weight_decay=_cfg.weight_decay,
+        block_size=_cfg.block_size,
     )
     return model, optimizer
 
@@ -145,22 +149,15 @@ def build_optimizer(model, method_name, prebuilt_optimizer=None):
         else:
             body_params.append(p)
 
-    if method_name == "full":
-        return torch.optim.AdamW(
-            [
-                {"params": body_params, "lr": 2e-5},
-                {"params": head_params, "lr": 1e-3},
-            ],
-            betas=(0.9, 0.999),
-        )
-    else:
-        return torch.optim.AdamW(
-            [
-                {"params": body_params, "lr": 2e-5},
-                {"params": head_params, "lr": 1e-3},
-            ],
-            betas=(0.9, 0.999),
-        )
+    return torch.optim.AdamW(
+        [
+            {"params": body_params, "lr": _cfg.body_lr},
+            {"params": head_params, "lr": _cfg.head_lr},
+        ],
+        betas=_cfg.betas,
+        eps=_cfg.eps,
+        weight_decay=_cfg.weight_decay,
+    )
 
 
 def count_trainable(model):
