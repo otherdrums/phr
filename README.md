@@ -13,7 +13,7 @@ codebook-indexed weights with learnable residuals.
 - **37% VRAM reduction** vs full fine-tune (1.7 GB vs 2.7 GB on BERT-base, batch=8)
 - **3 bytes/weight** persistent storage (uint8 indices + bf16 residual + 256-entry LUT)
 - **8-bit AdamW optimizer** (`FusedQuantizedAdam`) via Triton — int8 m/v moments save 6 bytes per trainable param, with full β₁=0.9 momentum matching standard AdamW
-- **3-phase LR schedule** — linear warmup → constant hold → linear decay, with differential LR for body (2e-5) vs classification head (1e-3)
+- **3-phase LR schedule** — linear warmup → constant hold → cosine decay, with differential LR for body (2e-5) vs classification head (1e-3)
 - **Learnable 256-entry codebook** with multiplicative nibble encoding
 - **Fused CUDA decode kernel** — no persistent full-precision weight matrix materialized
 - **Drop-in replacement** for `nn.Linear` in any HuggingFace model
@@ -92,7 +92,29 @@ with `pip install -e .`.
 from transformers import AutoModelForSequenceClassification
 from phr import compress_model, PHRConfig, FusedQuantizedAdam
 from torch.optim.lr_scheduler import (
-    LinearLR, SequentialLR
+    LinearLR, SequentialLR, LambdaLR
+)
+import math
+
+def _cosine_factor(total, min_factor):
+    """Lambda function: 1.0 → min_factor cosine decay."""
+    return lambda s: min_factor + 0.5 * (1 - min_factor) * \
+        (1 + math.cos(math.pi * min(s / total, 1)))
+
+# 3-phase LR schedule: warmup → hold → cosine decay
+total_steps = len(train_loader) * num_epochs
+warmup_steps = int(0.02 * total_steps)     # 2% warmup
+hold_start = int(0.60 * total_steps)       # decay starts at 60%
+scheduler = SequentialLR(
+    optimizer,
+    schedulers=[
+        LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps),
+        LinearLR(optimizer, start_factor=1.0, end_factor=1.0,
+                 total_iters=hold_start - warmup_steps),
+        LambdaLR(optimizer, lr_lambda=_cosine_factor(
+            total_steps - hold_start, 0.1)),
+    ],
+    milestones=[warmup_steps, hold_start],
 )
 
 config = PHRConfig(
