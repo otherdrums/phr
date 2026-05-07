@@ -195,7 +195,7 @@ def run(quick=False, method_filter=None, epochs=5):
 
             steps_per_epoch = (train_steps + ACC_STEPS - 1) // ACC_STEPS
             total_opt_steps = steps_per_epoch * EPOCHS
-            warmup_steps = int(0.06 * total_opt_steps)
+            warmup_steps = min(total_opt_steps // 10, 300)
             scheduler = SequentialLR(
                 optimizer,
                 schedulers=[
