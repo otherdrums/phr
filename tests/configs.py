@@ -6,7 +6,7 @@ import torch.nn as nn
 from transformers import BertForSequenceClassification
 
 from phr import compress_model, PHRConfig, FusedQuantizedAdam
-from .training_config import TrainingConfig
+from .training_config import TrainingConfig, method_lr_config
 
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
@@ -41,7 +41,7 @@ def build_bitfit():
 
 
 def build_lora():
-    """LoRA adapters on attention Q+V projections, r=8."""
+    """LoRA adapters on attention Q+V projections, r=8, α=r per Hu et al. 2021."""
     from peft import LoraConfig, get_peft_model
 
     torch.manual_seed(SHARED_SEED)
@@ -53,7 +53,7 @@ def build_lora():
 
     lora_config = LoraConfig(
         r=8,
-        lora_alpha=16,
+        lora_alpha=8,
         target_modules=["query", "value"],
         lora_dropout=0.0,
         bias="none",
@@ -64,7 +64,7 @@ def build_lora():
 
 
 def build_qlora():
-    """8-bit quantized BERT with LoRA adapters, r=8."""
+    """8-bit quantized BERT with LoRA adapters, r=8, α=r."""
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
     from transformers import BitsAndBytesConfig
 
@@ -87,7 +87,7 @@ def build_qlora():
 
     lora_config = LoraConfig(
         r=8,
-        lora_alpha=16,
+        lora_alpha=8,
         target_modules=["query", "value"],
         lora_dropout=0.0,
         bias="none",
@@ -135,9 +135,16 @@ def build_phr():
 
 
 def build_optimizer(model, method_name, prebuilt_optimizer=None):
-    """Create the appropriate optimizer for a given method."""
+    """Create the appropriate optimizer for a given method.
+
+    Uses method-specific LRs and weight_decay from METHOD_CONFIGS.
+    Non-PHR methods use same LR for body and head (no differential LR)
+    per standard practice in LoRA, QLoRA, and BitFit papers.
+    """
     if prebuilt_optimizer is not None:
         return prebuilt_optimizer
+
+    mc = method_lr_config(method_name)
 
     head_params = []
     body_params = []
@@ -151,12 +158,12 @@ def build_optimizer(model, method_name, prebuilt_optimizer=None):
 
     return torch.optim.AdamW(
         [
-            {"params": body_params, "lr": _cfg.body_lr},
-            {"params": head_params, "lr": _cfg.head_lr},
+            {"params": body_params, "lr": mc["body_lr"]},
+            {"params": head_params, "lr": mc["head_lr"]},
         ],
         betas=_cfg.betas,
         eps=_cfg.eps,
-        weight_decay=_cfg.weight_decay,
+        weight_decay=mc["weight_decay"],
     )
 
 
