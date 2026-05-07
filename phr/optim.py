@@ -64,7 +64,7 @@ def _fused_adam_8bit_kernel(
     m_rounded = tl.where(m_new >= 0.0, m_new / new_m_scale + 0.5, m_new / new_m_scale - 0.5).to(tl.int32)
     m_i8_new = tl.minimum(tl.maximum(m_rounded, -127), 127)
     v_rounded = (v_new / new_v_scale + 0.5).to(tl.int32)
-    v_i8_new = tl.minimum(tl.maximum(v_rounded, 0), 127)
+    v_i8_new = tl.minimum(tl.maximum(v_rounded, 1), 127)
 
     m_hat = m_new / bias_correction1
     v_hat = v_new / bias_correction2
