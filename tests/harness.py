@@ -306,6 +306,7 @@ def run(quick=False, method_filter=None, epochs=5):
                 "trainable_params_m": trainable / 1e6,
                 "total_time_s": total_time,
                 "epochs": EPOCHS,
+                "format_version": 1,
                 "training_config": cfg.to_dict(),
             }, idle_vram)
 
