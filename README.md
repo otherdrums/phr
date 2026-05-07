@@ -13,7 +13,6 @@ codebook-indexed weights with learnable residuals.
 - **37% VRAM reduction** vs full fine-tune (1.7 GB vs 2.7 GB on BERT-base, batch=8)
 - **3 bytes/weight** persistent storage (uint8 indices + bf16 residual + 256-entry LUT)
 - **8-bit AdamW optimizer** via Triton — int8 m/v moments save 6 bytes per trainable param
-- **Architecture-level offload decoupling** — frozen W_p never needs writeback, enabling zero-overhead streaming to CPU/RAM for multi-GB additional savings on large models
 - **Learnable 256-entry codebook** with multiplicative nibble encoding
 - **Fused CUDA decode kernel** — no persistent full-precision weight matrix materialized
 - **Drop-in replacement** for `nn.Linear` in any HuggingFace model
@@ -149,36 +148,6 @@ Straight-Through Estimator, while W_f learns the residual correction.
 This gives the representational capacity of full-precision training at
 3 bytes per weight.
 
-## Architecture-Level Offload Decoupling
-
-PHR's three-component weight representation inherently decouples storage from compute,
-enabling zero-overhead offloading of non-speed-critical data to system RAM:
-
-| Component | Access pattern | Offloadable? | Why |
-|-----------|---------------|:-----------:|-----|
-| **W_p** (uint8 indices) | Read only, sequential per layer, NEVER written after init | ✓ | Frozen indices. Predictable access order. No writeback needed. |
-| **W_f** (bf16 residual) | Read every layer, written at optimizer step | ✓ | Prefetchable per layer. Writeback only at step() time (every acc_steps batches). |
-| **m, v** (int8 moments) | Accessed only at optimizer step | ✓ | Not needed during forward/backward. Swap in/out at step boundaries. |
-| **lut** (fp32 codebook) | Read every layer | — | Tiny (256 entries = 1 KB). Not worth the offload overhead. |
-| **Activations** | Read/written every layer | ✗ | Speed-critical. Already handled by gradient checkpointing. |
-
-**How it works:** Before processing layer N, the next layer's W_p and W_f are
-asynchronously streamed from CPU to GPU via a dedicated CUDA stream. The PCIe
-transfer overlaps with layer N's compute — by the time layer N finishes, layer N+1's
-weights are already on GPU. The transfer latency is completely hidden.
-
-**Why this is possible when standard training isn't:** Standard training stores one
-mutable weight matrix — it must stay on GPU because every parameter can change at
-every step. PHR splits the weight into a frozen index matrix (W_p) that never
-mutates and a trainable residual (W_f) that changes only at optimizer steps. The
-frozen half carries zero coherence overhead. The trainable half is accessed at
-well-defined, predictable intervals.
-
-**Impact on large models:** For LLaMA-7B, W_p alone is 7 GB. Offloading it reduces
-GPU VRAM from 40 GB to ~33 GB with zero performance loss. Offloading W_f and
-optimizer states as well brings it to ~5 GB — fitting LLaMA-7B fine-tuning on a
-consumer GPU (GTX 1660, 6 GB) with <2% training throughput reduction.
-
 ## VRAM Savings (BERT-base SST-2, batch=8)
 
 On a single GPU, PHR peaks at **1.7 GB** vs **2.7 GB** for full fine-tune —
@@ -249,6 +218,23 @@ python -m tests.harness --quick            # 10-batch quick check
 python -m tests.harness --method=phr       # PHR only
 python -m tests.harness --epochs=3         # Custom epoch count
 ```
+
+## Roadmap
+
+Features planned but not yet implemented:
+
+- **CPU offloading** — stream frozen W_p and optimizer states to system RAM
+  via async CUDA copies. The `offload_frozen_params` flag in `PHRConfig` is a
+  stub; the `OffloadManager` described in the design docs has not been built.
+  Target: reduce LLaMA-7B training from 40 GB to ~5 GB GPU VRAM.
+- **4-bit packed quantization** — sub-8-bit codebooks (16-entry LUT) with
+  nibble-packed W_p for further VRAM reduction on output layers.
+- **Mixed-precision routing** — per-layer bit-width allocation based on
+  sensitivity profiling (residual_ratio), with passthrough for high-sensitivity
+  layers and aggressive crushing for dead-weight layers.
+- **Momentum in FusedQuantizedAdam** — currently uses `betas=(0.0, 0.999)`
+  (no first moment). Adding β₁=0.9 is a one-line change that may close the
+  remaining accuracy gap to full fine-tune.
 
 ## License
 
