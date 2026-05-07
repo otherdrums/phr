@@ -366,6 +366,7 @@ def _print_table(entries):
 
 if __name__ == "__main__":
     quick = "--quick" in sys.argv
+    run_all = "--all" in sys.argv
     method_filter = None
     epochs = 5
     for arg in sys.argv:
@@ -373,4 +374,6 @@ if __name__ == "__main__":
             method_filter = arg.split("=")[1]
         elif arg.startswith("--epochs="):
             epochs = int(arg.split("=")[1])
+    if run_all:
+        method_filter = None
     run(quick=quick, method_filter=method_filter, epochs=epochs)

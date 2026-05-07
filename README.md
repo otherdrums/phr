@@ -259,15 +259,31 @@ trains 0.5% of the model and achieves good results on well-behaved tasks. PHR
 trains 100% of the weights through a compressed lens with little to no accuracy
 loss while keeping the model 25% smaller than fp32.
 
+Beyond the VRAM savings already realized, PHR's three-component weight
+representation inherently decouples storage from compute. Frozen W_p indices
+never mutate after initialization, so only one layer needs to live on GPU at a
+time — the rest can stream asynchronously from system RAM with zero training
+slowdown. Combined with FusedQuantizedAdam's int8 moments (which are only
+touched at optimizer step boundaries), this architecture enables an additional
+path to multi-GB VRAM reduction on large models without any code changes to the
+training loop itself.
+
 ## Testing
 
 Run the SST-2 comparison harness:
 
 ```bash
-python -m tests.harness                    # Full 5-epoch comparison
+python -m tests.harness                    # All methods, 5 epochs
+python -m tests.harness --all              # Same — explicit full comparison
 python -m tests.harness --quick            # 10-batch quick check
 python -m tests.harness --method=phr       # PHR only
 python -m tests.harness --epochs=3         # Custom epoch count
+```
+
+After training, generate analysis:
+
+```bash
+python -m tests.analyzer                   # Tables + charts in results/_analysis/
 ```
 
 ## Roadmap
