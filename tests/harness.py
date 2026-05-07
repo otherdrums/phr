@@ -24,7 +24,7 @@ datasets.disable_progress_bar()
 from .configs import METHODS, build_optimizer, count_trainable
 from .training import train_one_epoch, evaluate
 from .memory_tracker import MemoryTracker, gpu_used_mb
-from torch.optim.lr_scheduler import LinearLR, SequentialLR
+from torch.optim.lr_scheduler import LinearLR
 
 from datetime import datetime
 
@@ -195,14 +195,9 @@ def run(quick=False, method_filter=None, epochs=5):
 
             steps_per_epoch = (train_steps + ACC_STEPS - 1) // ACC_STEPS
             total_opt_steps = steps_per_epoch * EPOCHS
-            warmup_steps = min(total_opt_steps // 10, 300)
-            scheduler = SequentialLR(
-                optimizer,
-                schedulers=[
-                    LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps),
-                    LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=total_opt_steps - warmup_steps),
-                ],
-                milestones=[warmup_steps],
+            warmup_steps = min(total_opt_steps // 20, 200)
+            scheduler = LinearLR(
+                optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps
             )
 
             total_time = 0
