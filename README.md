@@ -216,10 +216,8 @@ PHR and LoRA-family methods address the VRAM problem from opposite directions:
 and answers with a low-rank decomposition. PHR asks "how compact can we store the
 full training surface?" and answers with a learnable codebook + residual. LoRA
 trains 0.5% of the model and achieves good results on well-behaved tasks. PHR
-trains 100% of the weights through a compressed lens and gets within 1.5% of
-full fine-tune — with momentum β₁=0.9 now enabled (matching full fine-tune's
-β₁), plus scheduler tuning and progressive unfreezing as further improvement
-paths — while keeping the model 25% smaller than fp32.
+trains 100% of the weights through a compressed lens with little to no accuracy
+loss while keeping the model 25% smaller than fp32.
 
 ## Testing
 
