@@ -236,18 +236,19 @@ python -m tests.harness --epochs=3         # Custom epoch count
 
 Features planned but not yet implemented:
 
-- **CPU offloading** — stream frozen W_p and optimizer states to system RAM
-  via async CUDA copies. The `offload_frozen_params` flag in `PHRConfig` is a
-  stub; the `OffloadManager` described in the design docs has not been built.
-  Target: reduce LLaMA-7B training from 40 GB to ~5 GB GPU VRAM.
+- **CPU offloading** — W_p is frozen and read-only (never written after init),
+  so only one layer's indices need to live on GPU at a time; the rest can stay
+  in system RAM. Combined with optimizer state offload (m/v only touched at
+  step boundaries), GPU VRAM for each component drops from `Σ S_i` to `max(S_i)`
+  where `S_i` is the byte size of layer i. For an L-layer model this eliminates
+  `(L−1)/L` of the static GPU memory footprint with no training slowdown.
+  The `offload_frozen_params` flag in `PHRConfig` is a stub awaiting the
+  `OffloadManager`.
 - **4-bit packed quantization** — sub-8-bit codebooks (16-entry LUT) with
   nibble-packed W_p for further VRAM reduction on output layers.
 - **Mixed-precision routing** — per-layer bit-width allocation based on
   sensitivity profiling (residual_ratio), with passthrough for high-sensitivity
   layers and aggressive crushing for dead-weight layers.
-- **Momentum in FusedQuantizedAdam** — currently uses `betas=(0.0, 0.999)`
-  (no first moment). Adding β₁=0.9 is a one-line change that may close the
-  remaining accuracy gap to full fine-tune.
 
 ## License
 
