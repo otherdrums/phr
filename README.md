@@ -61,7 +61,7 @@ pip install -r requirements.txt
 Or install directly:
 
 ```bash
-pip install torch triton transformers datasets pynvml
+pip install torch triton transformers datasets nvidia-ml-py
 ```
 
 No `setup.py` is needed — PHR is a single `phr/` package that can be
@@ -244,11 +244,10 @@ PHR is the right choice when:
 Run the SST-2 comparison harness:
 
 ```bash
-cd tests
-python harness.py                    # Full 5-epoch comparison
-python harness.py --quick            # 10-batch quick check
-python harness.py --method=phr       # PHR only
-python harness.py --epochs=3         # Custom epoch count
+python -m tests.harness                    # Full 5-epoch comparison
+python -m tests.harness --quick            # 10-batch quick check
+python -m tests.harness --method=phr       # PHR only
+python -m tests.harness --epochs=3         # Custom epoch count
 ```
 
 ## License
