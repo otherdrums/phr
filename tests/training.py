@@ -1,10 +1,18 @@
 """Shared training/eval loop — heartbeat every 100 batches, real VRAM only."""
 
 import time
+import json
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from .memory_tracker import MemoryTracker, gpu_used_mb
+
+
+def _append_log(log_path, entry):
+    if log_path is None:
+        return
+    with open(log_path, "a") as f:
+        f.write(json.dumps(entry) + "\n")
 
 
 def train_one_epoch(
@@ -19,6 +27,7 @@ def train_one_epoch(
     tracker=None,
     criterion=None,
     scheduler=None,
+    log_path=None,
 ):
     if criterion is None:
         criterion = nn.CrossEntropyLoss()
@@ -65,12 +74,27 @@ def train_one_epoch(
                 f"loss {running_loss:.4f} | acc {running_acc:.2f}% | "
                 f"VRAM {vram:.0f}MB | {elapsed:.0f}s"
             )
+            _append_log(log_path, {
+                "epoch": epoch,
+                "step": batch_idx + 1,
+                "event": "heartbeat",
+                "loss": round(running_loss, 5),
+                "train_acc": round(running_acc, 2),
+                "vram_mb": vram,
+                "elapsed_s": int(elapsed),
+            })
 
         # Validate on schedule
         if (batch_idx + 1) % val_steps == 0 and val_loader is not None:
             acc = evaluate(model, val_loader, device)
             val_accuracies[batch_idx + 1] = acc
             print(f"  -- val acc {acc:.2f}%")
+            _append_log(log_path, {
+                "epoch": epoch,
+                "step": batch_idx + 1,
+                "event": "val",
+                "val_acc": round(acc, 2),
+            })
 
     if (batch_idx + 1) % acc_steps != 0:
         optimizer.step()

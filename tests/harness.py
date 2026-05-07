@@ -224,6 +224,10 @@ def run(quick=False, method_filter=None, epochs=5):
             peak_nvml = 0
             oom = False
 
+            out_dir = os.path.join(RESULTS_DIR, f"sst2_{method_key}_seed42_{RUN_ID}")
+            os.makedirs(out_dir, exist_ok=True)
+            log_path = os.path.join(out_dir, "training_log.jsonl")
+
             if quick:
                 model.train()
                 optimizer.zero_grad()
@@ -271,6 +275,7 @@ def run(quick=False, method_filter=None, epochs=5):
                         acc_steps=ACC_STEPS, val_loader=val_loader,
                         val_steps=val_steps, tracker=tracker,
                         scheduler=scheduler,
+                        log_path=log_path,
                     )
                     epoch_time = time.time() - t0
                     total_time += epoch_time
