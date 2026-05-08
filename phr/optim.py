@@ -5,7 +5,7 @@ Stores optimizer moment buffers (m, v) as int8 with per-block scales.
 ~75% memory reduction vs standard Adam (2 bytes/param vs 8 bytes/param).
 
 When offloading is enabled, m/v/scales are stored in pinned CPU memory
-and streamed to GPU one param at a time during step().
+and streamed to GPU in chunks (~100MB each) during step().
 """
 
 import torch
@@ -78,8 +78,7 @@ def _fused_adam_8bit_kernel(
 
 
 class FusedQuantizedAdam(torch.optim.Optimizer):
-    """
-    8-bit AdamW with per-block quantization.
+    """8-bit AdamW with per-block quantization.
 
     Args:
         params:      iterable of parameters
@@ -109,7 +108,7 @@ class FusedQuantizedAdam(torch.optim.Optimizer):
         self._offload_enabled = False
 
     def enable_offload(self, manager):
-        """Connect to an OffloadManager for optimizer state streaming."""
+        """Connect to an OffloadManager for chunked optimizer state streaming."""
         self._offload_mgr = manager
         self._offload_enabled = True
         manager._init_opt_offload(self)
@@ -134,66 +133,77 @@ class FusedQuantizedAdam(torch.optim.Optimizer):
             bias1 = 1.0 - beta1 ** step
             bias2 = 1.0 - beta2 ** step
 
+            # ── Offload path: stream chunks ──
+            if self._offload_enabled and self._offload_mgr.num_chunks > 0:
+                for chunk_idx in range(self._offload_mgr.num_chunks):
+                    self._offload_mgr.prefetch_chunk(chunk_idx, self)
+
+                    for pid in self._offload_mgr._opt_chunks[chunk_idx]["pids"]:
+                        p = self._offload_mgr._opt_pid_to_param.get(pid)
+                        if p is None or p.grad is None:
+                            continue
+                        state = self.state[p]
+                        if state is None:
+                            continue
+
+                        grad = p.grad
+                        p_data = p.data.contiguous()
+                        g_data = grad.contiguous()
+                        N = p_data.numel()
+                        num_blocks = (N + block - 1) // block
+
+                        _fused_adam_8bit_kernel[(num_blocks,)](
+                            p_data, g_data,
+                            state["m"], state["v"],
+                            state["m_scale"], state["v_scale"],
+                            lr, beta1, beta2, eps,
+                            bias1, bias2, wd, N,
+                            BLOCK=block,
+                        )
+                        if p.data.data_ptr() != p_data.data_ptr():
+                            p.data.copy_(p_data)
+
+                    self._offload_mgr.evict_chunk(chunk_idx, self)
+
+                continue  # offload path done, skip per-param loop
+
+            # ── Non-offload path: per-param ──
             for p in group["params"]:
                 if p.grad is None:
                     continue
-
                 grad = p.grad
                 if grad.is_sparse:
                     raise RuntimeError("FusedQuantizedAdam does not support sparse gradients")
 
                 state = self.state[p]
-
                 if "m" not in state:
-                    _init_state(state, p, block, offload=self._offload_enabled)
-
-                # ── Per-param offload: prefetch states CPU → GPU ──
-                if self._offload_enabled:
-                    self._offload_mgr.prefetch_param_states(state, id(p), p.device)
+                    _init_state(state, p, block)
 
                 p_data = p.data.contiguous()
                 g_data = grad.contiguous()
                 N = p_data.numel()
                 num_blocks = (N + block - 1) // block
 
-                grid = (num_blocks,)
-
-                _fused_adam_8bit_kernel[grid](
-                    p_data,
-                    g_data,
-                    state["m"],
-                    state["v"],
-                    state["m_scale"],
-                    state["v_scale"],
-                    lr,
-                    beta1,
-                    beta2,
-                    eps,
-                    bias1,
-                    bias2,
-                    wd,
-                    N,
+                _fused_adam_8bit_kernel[(num_blocks,)](
+                    p_data, g_data,
+                    state["m"], state["v"],
+                    state["m_scale"], state["v_scale"],
+                    lr, beta1, beta2, eps,
+                    bias1, bias2, wd, N,
                     BLOCK=block,
                 )
-
                 if p.data.data_ptr() != p_data.data_ptr():
                     p.data.copy_(p_data)
-
-                # ── Per-param offload: evict states GPU → CPU ──
-                if self._offload_enabled:
-                    self._offload_mgr.evict_param_states(state, id(p))
 
         return loss
 
     def zero_grad(self, set_to_none: bool = False):
-        """Override to forward set_to_none."""
         super().zero_grad(set_to_none=set_to_none)
 
 
 def _init_state(state, p, block_size, offload=False):
     N = p.numel()
     num_blocks = (N + block_size - 1) // block_size
-
     if offload:
         state["m"] = torch.zeros(N, dtype=torch.int8, pin_memory=True)
         state["v"] = torch.zeros(N, dtype=torch.int8, pin_memory=True)
