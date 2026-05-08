@@ -451,11 +451,15 @@ class OffloadManager:
                 state[key] = cpu[key].to(device, non_blocking=True)
 
     def evict_chunk(self, chunk, optimizer):
-        """Copy chunk's GPU states to pinned CPU synchronously.
+        """Copy chunk's GPU states to pinned CPU via offload-stream DMA.
 
-        Each param's states are copied back to the pinned CPU buffer
-        and the GPU tensor is freed (state[key] reassigned to CPU view).
+        All copies fire concurrently on the offload stream (after waiting
+        for the default stream's Triton kernels).  We sync once per chunk,
+        then free GPU memory by swapping to CPU views.
         """
+        # Wait for default stream (Triton kernels) before copying
+        self._stream.wait_stream(torch.cuda.current_stream())
+
         for pid in chunk["pids"]:
             cpu = self._opt_state_cpu[pid]
             p = self._opt_pid_to_param.get(pid)
@@ -463,5 +467,18 @@ class OffloadManager:
                 continue
             state = optimizer.state[p]
             for key in ("m", "v", "m_scale", "v_scale"):
-                cpu[key].copy_(state[key])
-                state[key] = cpu[key]  # swap to CPU view, free GPU tensor
+                with torch.cuda.stream(self._stream):
+                    cpu[key].copy_(state[key])
+
+        # Sync once — all copies are now complete
+        self._stream.synchronize()
+
+        # Safe to free GPU memory now
+        for pid in chunk["pids"]:
+            cpu = self._opt_state_cpu[pid]
+            p = self._opt_pid_to_param.get(pid)
+            if p is None:
+                continue
+            state = optimizer.state[p]
+            for key in ("m", "v", "m_scale", "v_scale"):
+                state[key] = cpu[key]  # CPU view (data now in pinned buffer)
