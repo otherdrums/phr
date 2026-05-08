@@ -8,6 +8,12 @@ Replaces nn.Linear with:
   - bias: optional bfloat16
 
 Total: 3 bytes/weight + 1 KB LUT overhead vs 4 bytes for float32.
+
+Offloading support:
+  attach_offload(mgr, name) → connects to OffloadManager.
+  During forward:  W_p is fetched from pinned CPU if needed.
+  During backward: W_p is re-fetched (if evicted after forward),
+                   then evicted after gradient computation.
 """
 
 import torch
@@ -56,13 +62,36 @@ class PHRLinear(nn.Module):
             torch.zeros(out_features, dtype=torch.bfloat16)
         ) if bias else None
 
+        self._offload_mgr = None
+        self._layer_name = None
+
+    def attach_offload(self, manager, layer_name):
+        """Connect this layer to an OffloadManager for W_p streaming.
+
+        After this call, W_p is managed by the OffloadManager:
+        - Evicted from GPU after forward (and after backward)
+        - Re-fetched in backward via ensure_wp
+        """
+        self._offload_mgr = manager
+        self._layer_name = layer_name
+
     def forward(self, x):
         orig_shape = x.shape
         if x.dim() == 3:
             x = x.reshape(-1, x.shape[-1])
 
-        # Kernel handles bf16 input natively — no .float() copy needed
-        out = PHRMatmulFunction.apply(x, self.W_p, self.W_f, self.lut)
+        mgr = self._offload_mgr
+        if mgr is not None:
+            mgr.ensure_wp(self._layer_name)
+
+        evict_cb = mgr.make_evict_cb(self._layer_name) if mgr else None
+        layer_name = self._layer_name if mgr else None
+        offload_mgr = mgr if mgr else None
+
+        out = PHRMatmulFunction.apply(
+            x, self.W_p, self.W_f, self.lut,
+            evict_cb, layer_name, offload_mgr,
+        )
 
         if self.bias_f is not None:
             out = out + self.bias_f

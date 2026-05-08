@@ -105,6 +105,18 @@ class FusedQuantizedAdam(torch.optim.Optimizer):
         )
         super().__init__(params, defaults)
         self._step_count = 0
+        self._offload_mgr = None
+        self._offload_level = 0
+
+    def enable_offload(self, manager, level):
+        """Connect to an OffloadManager for optimizer state streaming.
+
+        Args:
+            manager: OffloadManager instance (attached to model).
+            level:   Offload level (2 = storage offload, 3 = compute offload).
+        """
+        self._offload_mgr = manager
+        self._offload_level = level
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -125,6 +137,17 @@ class FusedQuantizedAdam(torch.optim.Optimizer):
 
             bias1 = 1.0 - beta1 ** step
             bias2 = 1.0 - beta2 ** step
+
+            # ── Level 3: CPU-side AdamW (entire step on CPU) ──
+            if self._offload_level >= 3 and self._offload_mgr is not None:
+                self._offload_mgr.compute_optim_step_cpu(
+                    self, bias1, bias2,
+                )
+                continue
+
+            # ── Level 2: prefetch all optimizer states to GPU once per step ──
+            if self._offload_level >= 2 and self._offload_mgr is not None:
+                self._offload_mgr.prefetch_optim_states(self)
 
             for p in group["params"]:
                 if p.grad is None:
@@ -166,6 +189,10 @@ class FusedQuantizedAdam(torch.optim.Optimizer):
 
                 if p.data.data_ptr() != p_data.data_ptr():
                     p.data.copy_(p_data)
+
+            # ── Level 2: evict all optimizer states back to CPU once per step ──
+            if self._offload_level >= 2 and self._offload_mgr is not None:
+                self._offload_mgr.evict_optim_states(self)
 
         return loss
 

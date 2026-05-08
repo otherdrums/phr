@@ -177,6 +177,7 @@ phr/
 ├── phr/
 │   ├── __init__.py          # Package exports
 │   ├── config.py            # PHRConfig dataclass
+│   ├── offload.py           # OffloadManager (CPU↔GPU tensor streaming)
 │   ├── layer.py             # PHRLinear nn.Module
 │   ├── autograd.py          # PHRMatmulFunction (custom autograd)
 │   ├── kernel.py            # CUDA decode kernel + phr_matmul
@@ -319,8 +320,26 @@ Features planned but not yet implemented:
   step boundaries), GPU VRAM for each component drops from `Σ S_i` to `max(S_i)`
   where `S_i` is the byte size of layer i. For an L-layer model this eliminates
   `(L−1)/L` of the static GPU memory footprint with no training slowdown.
-  The `offload_frozen_params` flag in `PHRConfig` is a stub awaiting the
-  `OffloadManager`.
+
+  Set `offload_level` in `PHRConfig`:
+  - `offload_level=0` — No offloading (default, all GPU-resident)
+  - `offload_level=1` — W_p streaming from pinned CPU RAM via double-buffered
+    async transfers. GPU holds ≤2 layers' W_p simultaneously.
+  - `offload_level=2` — Level 1 + optimizer state storage offload.
+    int8 m/v live on CPU, prefetched to GPU only during `step()`.
+  - `offload_level=3` — Level 1 + optimizer compute offload.
+    AdamW update runs entirely on CPU, freeing GPU for the next forward pass.
+
+  ```python
+  config = PHRConfig(offload_level=1, wp_prefetch_depth=1)
+  model = compress_model(model, config)
+  ```
+
+  The harness supports it via `--offload=N`:
+  ```bash
+  python -m tests.harness --method=phr --offload=1
+  ```
+
 - **4-bit packed quantization** — sub-8-bit codebooks (16-entry LUT) with
   nibble-packed W_p for further VRAM reduction on output layers.
 - **Mixed-precision routing** — per-layer bit-width allocation based on

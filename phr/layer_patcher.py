@@ -3,14 +3,21 @@
 import torch.nn as nn
 from .layer import PHRLinear
 from .config import PHRConfig
+from .offload import OffloadManager
 
 
 def compress_model(model: nn.Module, config: PHRConfig = None):
     """
     Replace nn.Linear layers in a model with PHR-compressed equivalents.
+
+    Returns:
+        model: nn.Module with PHRLinear layers.
+        The OffloadManager (if active) is attached as model._offload_manager.
     """
     if config is None:
         config = PHRConfig()
+
+    phr_layers = []  # ordered (name, PHRLinear) for offload sequencing
 
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
@@ -28,8 +35,25 @@ def compress_model(model: nn.Module, config: PHRConfig = None):
             parent = getattr(parent, part)
         setattr(parent, parts[-1], phr)
 
+        phr_layers.append((name, phr))
+
     if config.gradient_checkpointing:
         _enable_gradient_checkpointing(model)
+
+    if config.offload_level >= 1 and phr_layers:
+        # Model must be on CUDA before we can capture W_p for offloading.
+        # If not already, move it now (subsequent .cuda() calls are no-ops).
+        if next(model.parameters()).is_cpu:
+            model.cuda()
+
+        mgr = OffloadManager(prefetch_depth=config.wp_prefetch_depth)
+        layer_names = []
+        for name, phr in phr_layers:
+            mgr.register_wp(name, phr.W_p)
+            phr.attach_offload(mgr, name)
+            layer_names.append(name)
+        mgr.set_layer_sequence(layer_names)
+        model._offload_manager = mgr
 
     return model
 

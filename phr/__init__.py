@@ -14,8 +14,9 @@ from .kernel import phr_matmul
 from .autograd import PHRMatmulFunction
 from .layer import PHRLinear
 from .layer_patcher import compress_model
-from .config import PHRConfig, LowRamConfig, SchemeType
+from .config import PHRConfig, SchemeType
 from .optim import FusedQuantizedAdam
+from .offload import OffloadManager
 
 __all__ = [
     "phr_matmul",
@@ -23,7 +24,7 @@ __all__ = [
     "PHRLinear",
     "compress_model",
     "PHRConfig",
-    "LowRamConfig",
     "SchemeType",
     "FusedQuantizedAdam",
+    "OffloadManager",
 ]

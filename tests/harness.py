@@ -140,7 +140,7 @@ def _cleanup():
     torch.cuda.synchronize()
 
 
-def run(quick=False, method_filter=None, epochs=5):
+def run(quick=False, method_filter=None, epochs=5, offload_level=0):
     cfg = TrainingConfig(epochs=epochs)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -200,8 +200,13 @@ def run(quick=False, method_filter=None, epochs=5):
         try:
             # Suppress model loading progress bars (stderr)
             with redirect_stderr(io.StringIO()):
-                model, prebuilt_opt = build_fn()
-            model.to(device)
+                if method_key == "phr":
+                    model, prebuilt_opt = build_fn(offload_level=offload_level)
+                else:
+                    model, prebuilt_opt = build_fn()
+            # Skip model.to() when offloading — compress_model handles CUDA move
+            if not hasattr(model, '_offload_manager'):
+                model.to(device)
             tracker.snapshot_model()
 
             optimizer = build_optimizer(model, method_key, prebuilt_opt)
@@ -380,11 +385,14 @@ if __name__ == "__main__":
     run_all = "--all" in sys.argv
     method_filter = None
     epochs = 5
+    offload_level = 0
     for arg in sys.argv:
         if arg.startswith("--method="):
             method_filter = arg.split("=")[1]
         elif arg.startswith("--epochs="):
             epochs = int(arg.split("=")[1])
+        elif arg.startswith("--offload="):
+            offload_level = int(arg.split("=")[1])
     if run_all:
         method_filter = None
-    run(quick=quick, method_filter=method_filter, epochs=epochs)
+    run(quick=quick, method_filter=method_filter, epochs=epochs, offload_level=offload_level)
