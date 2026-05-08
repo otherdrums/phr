@@ -159,6 +159,18 @@ class OffloadManager:
     def sync(self):
         self._stream.synchronize()
 
+    def prefetch_first_wp(self):
+        """Prefetch W_p for the first layers in the sequence.
+
+        Called during optimizer.step() so the CPU→GPU copies overlap
+        with the Triton kernel and/or eviction transfers on the offload
+        stream.  When the next forward pass calls ensure_wp for the
+        first layer, the data is already on GPU (no fallback copy).
+        """
+        for d in range(self._prefetch_depth):
+            if d < len(self._layer_seq):
+                self.prefetch_wp(self._layer_seq[d])
+
     # ═══════════════════════════════════════════════════════════════
     # Optimizer state offloading  (level 2)
     # ═══════════════════════════════════════════════════════════════
@@ -244,15 +256,40 @@ class OffloadManager:
     def prefetch_optim_states(self, optimizer):
         """Batched CPU→GPU transfer for all optimizer states.
 
-        First call builds flat pinned CPU buffers.  Subsequent calls
-        copy the flat pinned buffers to flat GPU buffers and assign
-        per-param GPU views into optimizer.state.
+        First call builds flat pinned CPU buffers.  Subsequent calls:
+        1. Wait for any pending async eviction to complete
+        2. Assign per-param CPU views (fresh data from pinned buffers)
+        3. Copy flat pinned CPU → flat GPU (new allocation per step)
+        4. Assign per-param GPU views
         """
         if not self._opt_flat_cpu:
             self._build_opt_flat_buffers(optimizer)
         if not self._opt_flat_cpu:
             return
 
+        # ── Wait for previous async eviction (GPU→CPU copy) ──
+        if getattr(self, '_opt_evict_pending', False):
+            self._opt_evict_event.synchronize()
+            self._opt_evict_pending = False
+            # Old flat GPU buffers are no longer needed — free them
+            self._flat_gpu = {}
+            # Assign CPU views (data is now fresh in pinned buffers)
+            for key in ("m", "v", "m_scale", "v_scale"):
+                flat_cpu = self._opt_flat_cpu[key]
+                for group in optimizer.param_groups:
+                    for p in group["params"]:
+                        state = optimizer.state.get(p)
+                        if state is None or "m" not in state:
+                            continue
+                        off = self._opt_offsets.get(id(p))
+                        if off is None:
+                            continue
+                        start, size = off[key]
+                        if state[key].is_cuda or state[key].data_ptr() != \
+                                flat_cpu[start : start + size].data_ptr():
+                            state[key] = flat_cpu[start : start + size]
+
+        # ── Normal prefetch: CPU → GPU ──
         device = None
         for group in optimizer.param_groups:
             for p in group["params"]:
@@ -283,35 +320,48 @@ class OffloadManager:
     def evict_optim_states(self, optimizer):
         """Batched GPU→CPU transfer for all optimizer states.
 
-        Copies the flat GPU buffer (modified by Triton via views)
-        to pinned CPU — O(1) copies per step.  The flat GPU buffer
-        is freed; it is re-allocated on the next prefetch call.
+        First step: builds flat buffers, assigns CPU views (sync).
+        Subsequent steps: copies flat GPU → pinned CPU on the offload
+        stream (non-blocking).  The copy overlaps with the next forward
+        pass.  CPU view assignment and old GPU buffer cleanup are deferred
+        to the next prefetch call.
         """
         if not self._opt_flat_cpu:
             self._build_opt_flat_buffers(optimizer)
-        if not self._opt_flat_cpu:
+            # First step: _build_opt_flat_buffers already assigned CPU views.
+            # If no flat GPU yet (prefetch built the buffers), nothing to copy.
             return
 
         flat_gpu = getattr(self, '_flat_gpu', None) or {}
 
-        for key in ("m", "v", "m_scale", "v_scale"):
-            if key in flat_gpu:
-                self._opt_flat_cpu[key].copy_(flat_gpu[key])
+        if flat_gpu:
+            # ── Async eviction (subsequent steps) ──
+            for key in ("m", "v", "m_scale", "v_scale"):
+                if key in flat_gpu:
+                    with torch.cuda.stream(self._stream):
+                        self._opt_flat_cpu[key].copy_(flat_gpu[key], non_blocking=True)
 
-            for group in optimizer.param_groups:
-                for p in group["params"]:
-                    state = optimizer.state.get(p)
-                    if state is None or "m" not in state:
-                        continue
-                    off = self._opt_offsets.get(id(p))
-                    if off is None:
-                        continue
-                    start, size = off[key]
-                    if state[key].is_cuda or state[key].data_ptr() != \
-                            self._opt_flat_cpu[key][start : start + size].data_ptr():
-                        state[key] = self._opt_flat_cpu[key][start : start + size]
-
-        self._flat_gpu = {}
+            self._opt_evict_event = torch.cuda.Event()
+            self._opt_evict_event.record(self._stream)
+            self._opt_evict_pending = True
+            # Keep _flat_gpu alive — the offload stream still reads it
+        else:
+            # First step fallback: assign CPU views (should already be set)
+            for key in ("m", "v", "m_scale", "v_scale"):
+                flat_cpu = self._opt_flat_cpu[key]
+                for group in optimizer.param_groups:
+                    for p in group["params"]:
+                        state = optimizer.state.get(p)
+                        if state is None or "m" not in state:
+                            continue
+                        off = self._opt_offsets.get(id(p))
+                        if off is None:
+                            continue
+                        start, size = off[key]
+                        if state[key].is_cuda or state[key].data_ptr() != \
+                                flat_cpu[start : start + size].data_ptr():
+                            state[key] = flat_cpu[start : start + size]
+            self._flat_gpu = {}
 
     # ═══════════════════════════════════════════════════════════════
     # Optimizer compute offload  (level 3)

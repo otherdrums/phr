@@ -132,7 +132,7 @@ def build_phr(offload_level=0):
         weight_decay=_cfg.weight_decay,
         block_size=_cfg.block_size,
     )
-    if offload_level >= 2 and hasattr(model, '_offload_manager'):
+    if offload_level >= 1 and hasattr(model, '_offload_manager'):
         optimizer.enable_offload(model._offload_manager, offload_level)
     return model, optimizer
 

@@ -194,6 +194,10 @@ class FusedQuantizedAdam(torch.optim.Optimizer):
             if self._offload_level >= 2 and self._offload_mgr is not None:
                 self._offload_mgr.evict_optim_states(self)
 
+            # ── Level 1: fire W_p prefetches for next forward ──
+            if self._offload_level >= 1 and self._offload_mgr is not None:
+                self._offload_mgr.prefetch_first_wp()
+
         return loss
 
 
