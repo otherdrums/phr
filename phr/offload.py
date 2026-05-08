@@ -70,11 +70,20 @@ class OffloadManager:
         self._layer_index = {n: i for i, n in enumerate(names)}
 
     def _acquire_wp_buffer(self, cpu_buf, target_device):
-        """Get a GPU tensor from the pool (or allocate)."""
-        if self._wp_gpu_pool:
-            gpu = self._wp_gpu_pool.pop()
-            gpu.copy_(cpu_buf)  # fill with canonical data (sync on default stream)
-            return gpu
+        """Get a GPU tensor with canonical W_p data.
+
+        Reuses a pooled buffer of matching shape, or allocates new.
+        Copy runs on the offload stream; default stream waits via
+        stream dependency to prevent races with the matmul.
+        """
+        # Pop a matching-shape buffer from the pool
+        for i, gpu in enumerate(self._wp_gpu_pool):
+            if gpu.shape == cpu_buf.shape:
+                self._wp_gpu_pool.pop(i)
+                with torch.cuda.stream(self._stream):
+                    gpu.copy_(cpu_buf, non_blocking=True)
+                torch.cuda.current_stream().wait_stream(self._stream)
+                return gpu
         return cpu_buf.to(target_device)
 
     def _release_wp_buffer(self, gpu_tensor):
@@ -85,7 +94,7 @@ class OffloadManager:
         # (otherwise let Python GC free it)
 
     def prefetch_wp(self, name):
-        """Fire async CPU→GPU copy for W_p[name].  Non-blocking."""
+        """Synchronous CPU→GPU copy for W_p[name].  Runs on default stream."""
         if name in self._on_gpu or name in self._prefetch_buffers:
             return
         if name not in self._cpu_buffers or name not in self._wp_params:
@@ -94,17 +103,17 @@ class OffloadManager:
         target_device = self._wp_devices.get(name) or torch.device("cuda")
         cpu_buf = self._cpu_buffers[name]
 
-        if self._wp_gpu_pool:
-            gpu_tensor = self._wp_gpu_pool.pop()
+        gpu_tensor = None
+        for i, gpu in enumerate(self._wp_gpu_pool):
+            if gpu.shape == cpu_buf.shape:
+                gpu_tensor = self._wp_gpu_pool.pop(i)
+                break
+        if gpu_tensor is None:
+            gpu_tensor = cpu_buf.to(target_device)
         else:
-            gpu_tensor = torch.empty_like(cpu_buf, device=target_device)
+            gpu_tensor.copy_(cpu_buf)
 
-        event = torch.cuda.Event()
-        with torch.cuda.stream(self._stream):
-            gpu_tensor.copy_(cpu_buf, non_blocking=True)
-            event.record(self._stream)
-
-        self._prefetch_buffers[name] = (gpu_tensor, event)
+        self._prefetch_buffers[name] = (gpu_tensor, None)
 
     def ensure_wp(self, name):
         """Ensure W_p[name] is on GPU.  Schedules prefetch of nearby layers."""
@@ -113,8 +122,7 @@ class OffloadManager:
             return
 
         if name in self._prefetch_buffers:
-            gpu_tensor, event = self._prefetch_buffers.pop(name)
-            torch.cuda.current_stream().wait_event(event)
+            gpu_tensor, _ = self._prefetch_buffers.pop(name)
             self._wp_params[name].data = gpu_tensor
             self._on_gpu.add(name)
             self._schedule_prefetch(name)
@@ -145,6 +153,11 @@ class OffloadManager:
         return _cb
 
     def _schedule_prefetch(self, current_name):
+        """Prefetch W_p for layers following current_name (forward order).
+
+        Called from ensure_wp to keep the next prefetch_depth layers
+        streaming onto GPU while the current layer's matmul runs.
+        """
         idx = self._layer_index.get(current_name, -1)
         if idx < 0:
             return
@@ -152,9 +165,6 @@ class OffloadManager:
             nxt = idx + d
             if nxt < len(self._layer_seq):
                 self.prefetch_wp(self._layer_seq[nxt])
-            prv = idx - d
-            if prv >= 0:
-                self.prefetch_wp(self._layer_seq[prv])
 
     def sync(self):
         self._stream.synchronize()
