@@ -117,6 +117,8 @@ class FusedQuantizedAdam(torch.optim.Optimizer):
         """
         self._offload_mgr = manager
         self._offload_level = level
+        if level >= 2:
+            manager._init_opt_offload(self)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -159,6 +161,7 @@ class FusedQuantizedAdam(torch.optim.Optimizer):
 
                 state = self.state[p]
 
+                # Skip _init_state when offloading — flat buffers pre-allocated
                 if "m" not in state:
                     _init_state(state, p, block)
 
@@ -200,12 +203,22 @@ class FusedQuantizedAdam(torch.optim.Optimizer):
 
         return loss
 
+    def zero_grad(self, set_to_none: bool = False):
+        """Override to forward set_to_none."""
+        super().zero_grad(set_to_none=set_to_none)
 
-def _init_state(state, p, block_size):
+
+def _init_state(state, p, block_size, offload=False):
     N = p.numel()
     num_blocks = (N + block_size - 1) // block_size
 
-    state["m"] = torch.zeros(N, dtype=torch.int8, device=p.device)
-    state["v"] = torch.zeros(N, dtype=torch.int8, device=p.device)
-    state["m_scale"] = torch.ones(num_blocks, dtype=torch.float32, device=p.device)
-    state["v_scale"] = torch.ones(num_blocks, dtype=torch.float32, device=p.device)
+    if offload:
+        state["m"] = torch.zeros(N, dtype=torch.int8, pin_memory=True)
+        state["v"] = torch.zeros(N, dtype=torch.int8, pin_memory=True)
+        state["m_scale"] = torch.ones(num_blocks, dtype=torch.float32, pin_memory=True)
+        state["v_scale"] = torch.ones(num_blocks, dtype=torch.float32, pin_memory=True)
+    else:
+        state["m"] = torch.zeros(N, dtype=torch.int8, device=p.device)
+        state["v"] = torch.zeros(N, dtype=torch.int8, device=p.device)
+        state["m_scale"] = torch.ones(num_blocks, dtype=torch.float32, device=p.device)
+        state["v_scale"] = torch.ones(num_blocks, dtype=torch.float32, device=p.device)

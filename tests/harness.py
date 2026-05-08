@@ -246,7 +246,7 @@ def run(quick=False, method_filter=None, epochs=5, offload_level=0):
 
             if quick:
                 model.train()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 t0 = time.time()
                 for batch_idx, batch in enumerate(train_loader):
                     if batch_idx >= 10:
@@ -259,7 +259,7 @@ def run(quick=False, method_filter=None, epochs=5, offload_level=0):
                     loss.backward()
                     if (batch_idx + 1) % ACC_STEPS == 0:
                         optimizer.step()
-                        optimizer.zero_grad()
+                        optimizer.zero_grad(set_to_none=True)
                         tracker.step()
                 total_time = time.time() - t0
                 peak_torch = tracker.peak_torch_gb()

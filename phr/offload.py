@@ -159,6 +159,10 @@ class OffloadManager:
     def sync(self):
         self._stream.synchronize()
 
+    def _init_opt_offload(self, optimizer):
+        """Pre-allocate flat pinned CPU buffers.  Called from enable_offload."""
+        self._build_opt_flat_buffers(optimizer)
+
     def prefetch_first_wp(self):
         """Prefetch W_p for the first layers in the sequence.
 
@@ -176,77 +180,71 @@ class OffloadManager:
     # ═══════════════════════════════════════════════════════════════
 
     def _build_opt_flat_buffers(self, optimizer):
-        """One-time init: copy per-param GPU states into flat pinned CPU buffers.
+        """One-time init: pre-allocate flat pinned CPU buffers from param sizes.
 
-        Replaces optimizer.state entries with CPU views into the flat buffers
-        (freeing GPU memory in the process).
+        Called during enable_offload (before any step).  Allocates pinned
+        CPU tensors for m, v, m_scale, v_scale and assigns per-param CPU
+        views into optimizer.state.  No GPU memory is touched.
         """
-        offsets_m = []
-        offsets_v = []
-        offsets_ms = []
-        offsets_vs = []
+        block_size = 256
+        for group in optimizer.param_groups:
+            if "block_size" in group:
+                block_size = group["block_size"]
+                break
+
         sizes_m = []
         sizes_v = []
         sizes_ms = []
         sizes_vs = []
         pids = []
+        param_map = {}  # pid → param tensor
 
         for group in optimizer.param_groups:
             for p in group["params"]:
-                state = optimizer.state.get(p)
-                if state is None or "m" not in state:
+                if not p.requires_grad:
                     continue
                 pid = id(p)
+                N = p.numel()
+                nb = (N + block_size - 1) // block_size
+                sizes_m.append(N)
+                sizes_v.append(N)
+                sizes_ms.append(nb)
+                sizes_vs.append(nb)
                 pids.append(pid)
-                sizes_m.append(state["m"].numel())
-                sizes_v.append(state["v"].numel())
-                sizes_ms.append(state["m_scale"].numel())
-                sizes_vs.append(state["v_scale"].numel())
+                param_map[pid] = p
 
         if not sizes_m:
             return
 
-        total = lambda offsets, sizes: offsets[-1] + sizes[-1] if offsets else 0
+        offsets_m = [0]; _o = 0
+        for s in sizes_m[:-1]: _o += s; offsets_m.append(_o)
+        offsets_v = [0]; _o = 0
+        for s in sizes_v[:-1]: _o += s; offsets_v.append(_o)
+        offsets_ms = [0]; _o = 0
+        for s in sizes_ms[:-1]: _o += s; offsets_ms.append(_o)
+        offsets_vs = [0]; _o = 0
+        for s in sizes_vs[:-1]: _o += s; offsets_vs.append(_o)
 
-        for sizes, offsets in [(sizes_m, offsets_m), (sizes_v, offsets_v),
-                                (sizes_ms, offsets_ms), (sizes_vs, offsets_vs)]:
-            off = 0
-            for s in sizes:
-                offsets.append(off)
-                off += s
+        total_m  = offsets_m[-1]  + sizes_m[-1]  if sizes_m  else 0
+        total_v  = offsets_v[-1]  + sizes_v[-1]  if sizes_v  else 0
+        total_ms = offsets_ms[-1] + sizes_ms[-1] if sizes_ms else 0
+        total_vs = offsets_vs[-1] + sizes_vs[-1] if sizes_vs else 0
 
-        flat_m  = torch.empty(total(offsets_m, sizes_m),  dtype=torch.int8,    pin_memory=True)
-        flat_v  = torch.empty(total(offsets_v, sizes_v),  dtype=torch.int8,    pin_memory=True)
-        flat_ms = torch.empty(total(offsets_ms, sizes_ms), dtype=torch.float32, pin_memory=True)
-        flat_vs = torch.empty(total(offsets_vs, sizes_vs), dtype=torch.float32, pin_memory=True)
+        flat_m  = torch.zeros(total_m,  dtype=torch.int8,    pin_memory=True)
+        flat_v  = torch.zeros(total_v,  dtype=torch.int8,    pin_memory=True)
+        flat_ms = torch.ones(total_ms,  dtype=torch.float32, pin_memory=True)
+        flat_vs = torch.ones(total_vs,  dtype=torch.float32, pin_memory=True)
 
         for i, pid in enumerate(pids):
-            for group in optimizer.param_groups:
-                for p in group["params"]:
-                    if id(p) != pid:
-                        continue
-                    state = optimizer.state[p]
-                    om, sm = offsets_m[i], sizes_m[i]
-                    ov, sv = offsets_v[i], sizes_v[i]
-                    oms, sms = offsets_ms[i], sizes_ms[i]
-                    ovs, svs = offsets_vs[i], sizes_vs[i]
+            om, sm  = offsets_m[i],  sizes_m[i]
+            ov, sv  = offsets_v[i],  sizes_v[i]
+            oms, sms = offsets_ms[i], sizes_ms[i]
+            ovs, svs = offsets_vs[i], sizes_vs[i]
 
-                    flat_m[om : om + sm].copy_(state["m"])
-                    flat_v[ov : ov + sv].copy_(state["v"])
-                    flat_ms[oms : oms + sms].copy_(state["m_scale"])
-                    flat_vs[ovs : ovs + svs].copy_(state["v_scale"])
-
-                    # Replace GPU state tensors with CPU views (frees GPU memory)
-                    state["m"]       = flat_m[om : om + sm]
-                    state["v"]       = flat_v[ov : ov + sv]
-                    state["m_scale"] = flat_ms[oms : oms + sms]
-                    state["v_scale"] = flat_vs[ovs : ovs + svs]
-
-                    self._opt_offsets[pid] = {
-                        "m": (om, sm), "v": (ov, sv),
-                        "m_scale": (oms, sms), "v_scale": (ovs, svs),
-                    }
-                    break
+            self._opt_offsets[pid] = {
+                "m": (om, sm), "v": (ov, sv),
+                "m_scale": (oms, sms), "v_scale": (ovs, svs),
+            }
 
         self._opt_flat_cpu["m"] = flat_m
         self._opt_flat_cpu["v"] = flat_v
@@ -277,13 +275,11 @@ class OffloadManager:
             flat_cpu = self._opt_flat_cpu[key]
             for group in optimizer.param_groups:
                 for p in group["params"]:
-                    state = optimizer.state.get(p)
-                    if state is None or "m" not in state:
-                        continue
                     off = self._opt_offsets.get(id(p))
                     if off is None:
                         continue
                     start, size = off[key]
+                    state = optimizer.state[p]  # auto-creates dict
                     state[key] = flat_cpu[start : start + size]
 
         # ── 3. Allocate fresh flat GPU buffers ──
@@ -305,13 +301,11 @@ class OffloadManager:
             self._flat_gpu[key] = flat_gpu
             for group in optimizer.param_groups:
                 for p in group["params"]:
-                    state = optimizer.state.get(p)
-                    if state is None or "m" not in state:
-                        continue
                     off = self._opt_offsets.get(id(p))
                     if off is None:
                         continue
                     start, size = off[key]
+                    state = optimizer.state[p]
                     state[key] = flat_gpu[start : start + size]
 
     def evict_optim_states(self, optimizer):

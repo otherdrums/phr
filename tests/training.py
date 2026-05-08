@@ -41,7 +41,7 @@ def train_one_epoch(
     val_accuracies = {}
     epoch_start = time.time()
 
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
 
     for batch_idx, batch in enumerate(train_loader):
         ids = batch["input_ids"].to(device)
@@ -60,7 +60,7 @@ def train_one_epoch(
 
         if (batch_idx + 1) % acc_steps == 0:
             optimizer.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             tracker.step()
 
         # Heartbeat every 100 micro-batches
@@ -98,7 +98,7 @@ def train_one_epoch(
 
     if (batch_idx + 1) % acc_steps != 0:
         optimizer.step()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         tracker.step()
 
     train_loss = total_loss / len(train_loader)
