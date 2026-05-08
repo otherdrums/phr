@@ -257,39 +257,36 @@ class OffloadManager:
         """Batched CPU→GPU transfer for all optimizer states.
 
         First call builds flat pinned CPU buffers.  Subsequent calls:
-        1. Wait for any pending async eviction to complete
-        2. Assign per-param CPU views (fresh data from pinned buffers)
-        3. Copy flat pinned CPU → flat GPU (new allocation per step)
-        4. Assign per-param GPU views
+        1. Sync + free the PREVIOUS step's async GPU→CPU copy buffers.
+        2. Assign per-param CPU views (data now fresh in pinned buffers).
+        3. Allocate fresh flat GPU buffers and assign per-param GPU views.
         """
         if not self._opt_flat_cpu:
             self._build_opt_flat_buffers(optimizer)
         if not self._opt_flat_cpu:
             return
 
-        # ── Wait for previous async eviction (GPU→CPU copy) ──
-        if getattr(self, '_opt_evict_pending', False):
-            self._opt_evict_event.synchronize()
-            self._opt_evict_pending = False
-            # Old flat GPU buffers are no longer needed — free them
-            self._flat_gpu = {}
-            # Assign CPU views (data is now fresh in pinned buffers)
-            for key in ("m", "v", "m_scale", "v_scale"):
-                flat_cpu = self._opt_flat_cpu[key]
-                for group in optimizer.param_groups:
-                    for p in group["params"]:
-                        state = optimizer.state.get(p)
-                        if state is None or "m" not in state:
-                            continue
-                        off = self._opt_offsets.get(id(p))
-                        if off is None:
-                            continue
-                        start, size = off[key]
-                        if state[key].is_cuda or state[key].data_ptr() != \
-                                flat_cpu[start : start + size].data_ptr():
-                            state[key] = flat_cpu[start : start + size]
+        # ── 1. Free previous-step GPU buffers (copy completed during fwd) ──
+        if getattr(self, '_evict_pending', False):
+            self._evict_event.synchronize()
+            self._evict_pending = False
+            self._old_flat_gpu = None
 
-        # ── Normal prefetch: CPU → GPU ──
+        # ── 2. Assign CPU views (pinned buffer has fresh data from copy) ──
+        for key in ("m", "v", "m_scale", "v_scale"):
+            flat_cpu = self._opt_flat_cpu[key]
+            for group in optimizer.param_groups:
+                for p in group["params"]:
+                    state = optimizer.state.get(p)
+                    if state is None or "m" not in state:
+                        continue
+                    off = self._opt_offsets.get(id(p))
+                    if off is None:
+                        continue
+                    start, size = off[key]
+                    state[key] = flat_cpu[start : start + size]
+
+        # ── 3. Allocate fresh flat GPU buffers ──
         device = None
         for group in optimizer.param_groups:
             for p in group["params"]:
@@ -318,50 +315,65 @@ class OffloadManager:
                     state[key] = flat_gpu[start : start + size]
 
     def evict_optim_states(self, optimizer):
-        """Batched GPU→CPU transfer for all optimizer states.
+        """Batched GPU→CPU async copy for all optimizer states.
 
-        First step: builds flat buffers, assigns CPU views (sync).
-        Subsequent steps: copies flat GPU → pinned CPU on the offload
-        stream (non-blocking).  The copy overlaps with the next forward
-        pass.  CPU view assignment and old GPU buffer cleanup are deferred
-        to the next prefetch call.
+        First step: builds flat buffers (sync).
+        Subsequent steps: fires GPU→CPU copy on the offload stream
+        (non-blocking).  The copy overlaps with the next forward pass.
         """
         if not self._opt_flat_cpu:
             self._build_opt_flat_buffers(optimizer)
-            # First step: _build_opt_flat_buffers already assigned CPU views.
-            # If no flat GPU yet (prefetch built the buffers), nothing to copy.
             return
 
         flat_gpu = getattr(self, '_flat_gpu', None) or {}
+        if not flat_gpu:
+            return
 
-        if flat_gpu:
-            # ── Async eviction (subsequent steps) ──
-            for key in ("m", "v", "m_scale", "v_scale"):
-                if key in flat_gpu:
-                    with torch.cuda.stream(self._stream):
-                        self._opt_flat_cpu[key].copy_(flat_gpu[key], non_blocking=True)
+        for key in ("m", "v", "m_scale", "v_scale"):
+            if key in flat_gpu:
+                with torch.cuda.stream(self._stream):
+                    self._opt_flat_cpu[key].copy_(flat_gpu[key], non_blocking=True)
 
-            self._opt_evict_event = torch.cuda.Event()
-            self._opt_evict_event.record(self._stream)
-            self._opt_evict_pending = True
-            # Keep _flat_gpu alive — the offload stream still reads it
-        else:
-            # First step fallback: assign CPU views (should already be set)
-            for key in ("m", "v", "m_scale", "v_scale"):
-                flat_cpu = self._opt_flat_cpu[key]
-                for group in optimizer.param_groups:
-                    for p in group["params"]:
-                        state = optimizer.state.get(p)
-                        if state is None or "m" not in state:
-                            continue
-                        off = self._opt_offsets.get(id(p))
-                        if off is None:
-                            continue
-                        start, size = off[key]
-                        if state[key].is_cuda or state[key].data_ptr() != \
-                                flat_cpu[start : start + size].data_ptr():
-                            state[key] = flat_cpu[start : start + size]
+        self._evict_event = torch.cuda.Event()
+        self._evict_event.record(self._stream)
+        self._evict_pending = True
+
+        self._old_flat_gpu = flat_gpu
+        self._flat_gpu = {}
+
+    def finalize_opt_offload(self, optimizer=None):
+        """Sync pending eviction and free all GPU optimizer state buffers.
+
+        Args:
+            optimizer: If provided, per-param state views are replaced
+                       with CPU views (freeing GPU memory).  If None,
+                       only the event is synced and flat buffers freed.
+        """
+        if getattr(self, '_evict_pending', False):
+            self._evict_event.synchronize()
+            self._evict_pending = False
+            self._old_flat_gpu = None
             self._flat_gpu = {}
+
+            if optimizer is not None:
+                for key in ("m", "v", "m_scale", "v_scale"):
+                    flat_cpu = self._opt_flat_cpu.get(key)
+                    if flat_cpu is None:
+                        continue
+                    for group in optimizer.param_groups:
+                        for p in group["params"]:
+                            state = optimizer.state.get(p)
+                            if state is None or "m" not in state:
+                                continue
+                            off = self._opt_offsets.get(id(p))
+                            if off is None:
+                                continue
+                            start, size = off[key]
+                            if state[key].is_cuda or state[key].data_ptr() != \
+                                    flat_cpu[start : start + size].data_ptr():
+                                state[key] = flat_cpu[start : start + size]
+
+            torch.cuda.empty_cache()
 
     # ═══════════════════════════════════════════════════════════════
     # Optimizer compute offload  (level 3)
