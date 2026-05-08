@@ -27,7 +27,7 @@ class OffloadManager:
             raise RuntimeError("OffloadManager requires CUDA")
 
         self._prefetch_depth = max(prefetch_depth, 0)
-        self._stream = torch.cuda.Stream()  # for async eviction copies
+        self._stream = torch.cuda.Stream()  # for async eviction DMA
 
         # --- W_p tracking ---
         self._cpu_buffers = {}       # name → pinned CPU tensor (canonical copy)
@@ -45,6 +45,7 @@ class OffloadManager:
         self._opt_state_cpu = {}     # pid → {m, v, m_scale, v_scale} pinned CPU
         self._opt_chunks = []        # [{"pids": [...], "offsets": {pid: {key: (start,size)}}, "total": {key: int}}]
         self._opt_pid_to_param = {}  # pid → param tensor
+        self._pending_eviction = None  # {pid: {key: cpu_tensor}} from previous chunk
 
     # ═══════════════════════════════════════════════════════════════
     # W_p registration & lifecycle
@@ -212,9 +213,9 @@ class OffloadManager:
     def prefetch_chunk(self, chunk_idx, optimizer):
         """Copy chunk's pinned CPU states to GPU via non-blocking transfers.
 
-        All params' .to(device) calls are queued on the default stream,
-        then we sync once.  Each param gets its own GPU tensor (no shared
-        flat buffer), keeping peak GPU memory low.
+        Copies queue on the default stream.  Triton kernels run on the
+        same stream so ordering is guaranteed.  The eviction for the
+        previous chunk runs on the offload stream concurrently.
         """
         chunk = self._opt_chunks[chunk_idx]
         device = None
@@ -240,34 +241,52 @@ class OffloadManager:
     def evict_chunk(self, chunk_idx, optimizer):
         """Copy chunk's GPU states to pinned CPU via offload-stream DMA.
 
-        All copies run concurrently on the offload stream (after waiting
-        for the default stream's Triton kernels).  We sync once per
-        chunk, then free GPU memory by swapping to CPU views.
+        Double-buffered: the PREVIOUS chunk's eviction DMA is cleaned
+        up (completed by now since it overlapped with the current
+        chunk's compute), then the CURRENT chunk's eviction is fired
+        asynchronously.  For single-chunk models we sync immediately
+        to avoid stale GPU views during the next forward pass.
         """
-        chunk = self._opt_chunks[chunk_idx]
+        # ── 1. Clean up previous chunk's eviction (DMA done by now) ──
+        if self._pending_eviction is not None:
+            self._stream.synchronize()
+            for pid, cpu_dict in self._pending_eviction.items():
+                p = self._opt_pid_to_param.get(pid)
+                if p is None:
+                    continue
+                state = optimizer.state[p]
+                for key in ("m", "v", "m_scale", "v_scale"):
+                    state[key] = cpu_dict[key]
+            self._pending_eviction = None
 
-        # Wait for default stream (Triton kernels) before copying
+        # ── 2. Fire current chunk's eviction ──
+        chunk = self._opt_chunks[chunk_idx]
         self._stream.wait_stream(torch.cuda.current_stream())
 
-        for pid in chunk["pids"]:
-            cpu = self._opt_state_cpu[pid]
-            p = self._opt_pid_to_param.get(pid)
-            if p is None:
-                continue
-            state = optimizer.state[p]
-            for key in ("m", "v", "m_scale", "v_scale"):
-                with torch.cuda.stream(self._stream):
-                    cpu[key].copy_(state[key])
-
-        # Sync once — all copies are now complete
-        self._stream.synchronize()
-
-        # Safe to free GPU memory now
-        for pid in chunk["pids"]:
-            cpu = self._opt_state_cpu[pid]
-            p = self._opt_pid_to_param.get(pid)
-            if p is None:
-                continue
-            state = optimizer.state[p]
-            for key in ("m", "v", "m_scale", "v_scale"):
-                state[key] = cpu[key]  # CPU view (data is now in pinned buffer)
+        if self.num_chunks == 1:
+            # Single chunk: sync immediately (no next chunk to overlap with)
+            for pid in chunk["pids"]:
+                cpu = self._opt_state_cpu[pid]
+                p = self._opt_pid_to_param.get(pid)
+                if p is None:
+                    continue
+                state = optimizer.state[p]
+                for key in ("m", "v", "m_scale", "v_scale"):
+                    self._opt_state_cpu[pid][key].copy_(state[key])
+                    state[key] = self._opt_state_cpu[pid][key]
+        else:
+            # Multi-chunk: fire async, overlap with next chunk's compute
+            pending = {}
+            for pid in chunk["pids"]:
+                cpu = self._opt_state_cpu[pid]
+                p = self._opt_pid_to_param.get(pid)
+                if p is None:
+                    continue
+                state = optimizer.state[p]
+                pinned = {}
+                for key in ("m", "v", "m_scale", "v_scale"):
+                    with torch.cuda.stream(self._stream):
+                        cpu[key].copy_(state[key])
+                    pinned[key] = cpu[key]
+                pending[pid] = pinned
+            self._pending_eviction = pending
