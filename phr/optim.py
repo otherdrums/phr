@@ -133,37 +133,46 @@ class FusedQuantizedAdam(torch.optim.Optimizer):
             bias1 = 1.0 - beta1 ** step
             bias2 = 1.0 - beta2 ** step
 
-            # ── Offload path: GPU chunked Triton ──
+            # ── Offload path: GPU chunked Triton, per-group ──
             if self._offload_enabled and self._offload_mgr.num_chunks > 0:
-                for chunk_idx in range(self._offload_mgr.num_chunks):
-                    self._offload_mgr.prefetch_chunk(chunk_idx, self)
+                for group_idx, group in enumerate(self.param_groups):
+                    glr = group["lr"]
+                    gbeta1, gbeta2 = group["betas"]
+                    geps = group["eps"]
+                    gwd = group["weight_decay"]
+                    gblock = group["block_size"]
+                    gbias1 = 1.0 - gbeta1 ** step
+                    gbias2 = 1.0 - gbeta2 ** step
 
-                    for pid in self._offload_mgr._opt_chunks[chunk_idx]["pids"]:
-                        p = self._offload_mgr._opt_pid_to_param.get(pid)
-                        if p is None or p.grad is None:
-                            continue
-                        state = self.state[p]
-                        if state is None:
-                            continue
+                    for chunk in self._offload_mgr._opt_group_chunks[group_idx]:
+                        self._offload_mgr.prefetch_chunk(chunk, self)
 
-                        grad = p.grad
-                        p_data = p.data.contiguous()
-                        g_data = grad.contiguous()
-                        N = p_data.numel()
-                        num_blocks = (N + block - 1) // block
+                        for pid in chunk["pids"]:
+                            p = self._offload_mgr._opt_pid_to_param.get(pid)
+                            if p is None or p.grad is None:
+                                continue
+                            state = self.state[p]
+                            if state is None:
+                                continue
 
-                        _fused_adam_8bit_kernel[(num_blocks,)](
-                            p_data, g_data,
-                            state["m"], state["v"],
-                            state["m_scale"], state["v_scale"],
-                            lr, beta1, beta2, eps,
-                            bias1, bias2, wd, N,
-                            BLOCK=block,
-                        )
-                        if p.data.data_ptr() != p_data.data_ptr():
-                            p.data.copy_(p_data)
+                            grad = p.grad
+                            p_data = p.data.contiguous()
+                            g_data = grad.contiguous()
+                            N = p_data.numel()
+                            num_blocks = (N + gblock - 1) // gblock
 
-                    self._offload_mgr.evict_chunk(chunk_idx, self)
+                            _fused_adam_8bit_kernel[(num_blocks,)](
+                                p_data, g_data,
+                                state["m"], state["v"],
+                                state["m_scale"], state["v_scale"],
+                                glr, gbeta1, gbeta2, geps,
+                                gbias1, gbias2, gwd, N,
+                                BLOCK=gblock,
+                            )
+                            if p.data.data_ptr() != p_data.data_ptr():
+                                p.data.copy_(p_data)
+
+                        self._offload_mgr.evict_chunk(chunk, self)
 
                 continue  # skip per-param loop
 

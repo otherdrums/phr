@@ -163,9 +163,9 @@ class OffloadManager:
 
         # --- Optimizer state streaming (chunked) ---
         self._opt_state_cpu = {}     # pid → {m, v, m_scale, v_scale} pinned CPU
-        self._opt_chunks = []        # [{"pids": [...], "offsets": {pid: {key: (start,size)}}, "total": {key: int}}]
+        self._opt_group_chunks = []  # [[chunk, ...], [chunk, ...]] per group
         self._opt_pid_to_param = {}  # pid → param tensor
-        self._pending_eviction = None  # {pid: {key: cpu_tensor}} from previous chunk
+        self._pid_to_group = {}      # pid → group index
 
     # ═══════════════════════════════════════════════════════════════
     # W_p registration & lifecycle
@@ -269,7 +269,7 @@ class OffloadManager:
 
     @property
     def num_chunks(self):
-        return len(self._opt_chunks)
+        return sum(len(chunks) for chunks in self._opt_group_chunks)
 
     def _init_opt_offload(self, optimizer):
         """Pre-allocate per-param pinned CPU buffers, chunk groups, and
@@ -277,18 +277,19 @@ class OffloadManager:
 
         Called from enable_offload() before any optimizer step.
         """
-        if self._opt_chunks:
+        if self._opt_group_chunks:
             return
 
         # ── Pass 1: allocate per-param pinned CPU buffers ──
         all_pids = []
-        for group in optimizer.param_groups:
+        for group_idx, group in enumerate(optimizer.param_groups):
             block = group.get("block_size", 256)
             for p in group["params"]:
                 if not p.requires_grad:
                     continue
                 pid = id(p)
                 all_pids.append(pid)
+                self._pid_to_group[pid] = group_idx
                 self._opt_pid_to_param[pid] = p
                 N = p.numel()
                 nb = (N + block - 1) // block
@@ -302,28 +303,33 @@ class OffloadManager:
         # ── Pass 2: build flat pinned buffers + metadata for fused C++ kernel ──
         self._build_cpu_flat_buffers(all_pids)
 
-        # ── Pass 3: group pids into GPU chunks ──
-        current_chunk = {"pids": [], "offsets": {}, "total": {}}
-        for pid in all_pids:
-            cpu = self._opt_state_cpu[pid]
-            param_bytes = sum(cpu[k].numel() * cpu[k].element_size() for k in ("m", "v"))
-            if current_chunk["pids"] and any(
-                current_chunk["total"].get(k, 0) + cpu[k].numel() * cpu[k].element_size() > CHUNK_BYTES
-                for k in ("m", "v")
-            ):
-                self._opt_chunks.append(current_chunk)
-                current_chunk = {"pids": [], "offsets": {}, "total": {}}
+        # ── Pass 3: group pids into GPU chunks (per param group) ──
+        for group_idx, group in enumerate(optimizer.param_groups):
+            chunks = []
+            current_chunk = {"pids": [], "offsets": {}, "total": {}}
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                pid = id(p)
+                cpu = self._opt_state_cpu[pid]
+                if current_chunk["pids"] and any(
+                    current_chunk["total"].get(k, 0) + cpu[k].numel() * cpu[k].element_size() > CHUNK_BYTES
+                    for k in ("m", "v")
+                ):
+                    chunks.append(current_chunk)
+                    current_chunk = {"pids": [], "offsets": {}, "total": {}}
 
-            current_chunk["pids"].append(pid)
-            current_chunk["offsets"][pid] = {}
-            for key in ("m", "v", "m_scale", "v_scale"):
-                size = cpu[key].numel()
-                start = current_chunk["total"].get(key, 0)
-                current_chunk["offsets"][pid][key] = (start, size)
-                current_chunk["total"][key] = start + size
+                current_chunk["pids"].append(pid)
+                current_chunk["offsets"][pid] = {}
+                for key in ("m", "v", "m_scale", "v_scale"):
+                    size = cpu[key].numel()
+                    start = current_chunk["total"].get(key, 0)
+                    current_chunk["offsets"][pid][key] = (start, size)
+                    current_chunk["total"][key] = start + size
 
-        if current_chunk["pids"]:
-            self._opt_chunks.append(current_chunk)
+            if current_chunk["pids"]:
+                chunks.append(current_chunk)
+            self._opt_group_chunks.append(chunks)
 
     def _build_cpu_flat_buffers(self, pids):
         """Build flat pinned CPU buffers and metadata for fused CPU kernel."""
@@ -425,21 +431,12 @@ class OffloadManager:
                     p.data.copy_(self._flat_p[ps : ps + pn].view_as(p.data.float()).to(p.dtype))
         self._stream.synchronize()
 
-    def prefetch_chunk(self, chunk_idx, optimizer):
-        """Copy chunk's pinned CPU states to GPU via non-blocking transfers.
-
-        Copies queue on the default stream.  Triton kernels run on the
-        same stream so ordering is guaranteed.  The eviction for the
-        previous chunk runs on the offload stream concurrently.
-        """
-        chunk = self._opt_chunks[chunk_idx]
+    def prefetch_chunk(self, chunk, optimizer):
+        """Copy chunk's pinned CPU states to GPU via non-blocking transfers."""
         device = None
-        for group in optimizer.param_groups:
-            for p in group["params"]:
-                if p.device.type == "cuda":
-                    device = p.device
-                    break
-            if device is not None:
+        for p in optimizer.param_groups[0]["params"]:
+            if p.device.type == "cuda":
+                device = p.device
                 break
         if device is None:
             return
@@ -453,55 +450,18 @@ class OffloadManager:
             for key in ("m", "v", "m_scale", "v_scale"):
                 state[key] = cpu[key].to(device, non_blocking=True)
 
-    def evict_chunk(self, chunk_idx, optimizer):
-        """Copy chunk's GPU states to pinned CPU via offload-stream DMA.
+    def evict_chunk(self, chunk, optimizer):
+        """Copy chunk's GPU states to pinned CPU synchronously.
 
-        Double-buffered: the PREVIOUS chunk's eviction DMA is cleaned
-        up (completed by now since it overlapped with the current
-        chunk's compute), then the CURRENT chunk's eviction is fired
-        asynchronously.  For single-chunk models we sync immediately
-        to avoid stale GPU views during the next forward pass.
+        Each param's states are copied back to the pinned CPU buffer
+        and the GPU tensor is freed (state[key] reassigned to CPU view).
         """
-        # ── 1. Clean up previous chunk's eviction (DMA done by now) ──
-        if self._pending_eviction is not None:
-            self._stream.synchronize()
-            for pid, cpu_dict in self._pending_eviction.items():
-                p = self._opt_pid_to_param.get(pid)
-                if p is None:
-                    continue
-                state = optimizer.state[p]
-                for key in ("m", "v", "m_scale", "v_scale"):
-                    state[key] = cpu_dict[key]
-            self._pending_eviction = None
-
-        # ── 2. Fire current chunk's eviction ──
-        chunk = self._opt_chunks[chunk_idx]
-        self._stream.wait_stream(torch.cuda.current_stream())
-
-        if self.num_chunks == 1:
-            # Single chunk: sync immediately (no next chunk to overlap with)
-            for pid in chunk["pids"]:
-                cpu = self._opt_state_cpu[pid]
-                p = self._opt_pid_to_param.get(pid)
-                if p is None:
-                    continue
-                state = optimizer.state[p]
-                for key in ("m", "v", "m_scale", "v_scale"):
-                    self._opt_state_cpu[pid][key].copy_(state[key])
-                    state[key] = self._opt_state_cpu[pid][key]
-        else:
-            # Multi-chunk: fire async, overlap with next chunk's compute
-            pending = {}
-            for pid in chunk["pids"]:
-                cpu = self._opt_state_cpu[pid]
-                p = self._opt_pid_to_param.get(pid)
-                if p is None:
-                    continue
-                state = optimizer.state[p]
-                pinned = {}
-                for key in ("m", "v", "m_scale", "v_scale"):
-                    with torch.cuda.stream(self._stream):
-                        cpu[key].copy_(state[key])
-                    pinned[key] = cpu[key]
-                pending[pid] = pinned
-            self._pending_eviction = pending
+        for pid in chunk["pids"]:
+            cpu = self._opt_state_cpu[pid]
+            p = self._opt_pid_to_param.get(pid)
+            if p is None:
+                continue
+            state = optimizer.state[p]
+            for key in ("m", "v", "m_scale", "v_scale"):
+                cpu[key].copy_(state[key])
+                state[key] = cpu[key]  # swap to CPU view, free GPU tensor
