@@ -18,6 +18,8 @@ codebook-indexed weights with learnable residuals.
 - **Fused CUDA decode kernel** — no persistent full-precision weight matrix materialized
 - **Drop-in replacement** for `nn.Linear` in any HuggingFace model
 - **Gradient checkpointing** compatible
+- **CPU/system RAM offloading** — stream frozen W_p indices and optimizer states
+  from pinned system RAM to GPU on demand via `offload=True`
 
 ## Requirements
 
@@ -79,7 +81,7 @@ pip install -r requirements.txt
 Or install directly:
 
 ```bash
-pip install torch triton transformers datasets nvidia-ml-py
+pip install torch triton transformers datasets nvidia-ml-py peft
 ```
 
 No `setup.py` is needed — PHR is a single `phr/` package that can be
@@ -122,6 +124,7 @@ config = PHRConfig(
     layer_scope="ffn",        # compress FFN layers only
     learnable_lut=True,        # train the codebook
     gradient_checkpointing=True,
+    offload=True,              # enable CPU/system RAM offloading
 )
 
 model = AutoModelForSequenceClassification.from_pretrained(
@@ -283,14 +286,63 @@ trains 0.5% of the model and achieves good results on well-behaved tasks. PHR
 trains 100% of the weights through a compressed lens with little to no accuracy
 loss while keeping the model 25% smaller than fp32.
 
-Beyond the VRAM savings already realized, PHR's three-component weight
-representation inherently decouples storage from compute. Frozen W_p indices
-never mutate after initialization, so only one layer needs to live on GPU at a
-time — the rest can stream asynchronously from system RAM with zero training
-slowdown. Combined with FusedQuantizedAdam's int8 moments (which are only
-touched at optimizer step boundaries), this architecture enables an additional
-path to multi-GB VRAM reduction on large models without any code changes to the
-training loop itself.
+## CPU / System RAM Offloading
+
+PHR's three-component weight representation inherently decouples storage
+from compute.  Frozen W_p indices never mutate after initialization, so
+they can stream from pinned system RAM on demand — only the current
+layer's W_p needs GPU memory at any moment.  Combined with
+FusedQuantizedAdam's int8 moments, optimizer states live entirely in
+system RAM, streaming to GPU only during the optimizer step.
+
+Enable offloading with a single flag:
+
+```python
+config = PHRConfig(offload=True)
+model = compress_model(model, config)
+```
+
+The harness supports it via `--offload`:
+
+```bash
+python -m tests.harness --method=phr --offload
+```
+
+### Architecture
+
+The `OffloadManager` (`phr/offload.py`) coordinates three mechanisms:
+
+- **W_p streaming** — A small GPU buffer pool reuses tensors for the current
+  layer's forward pass.  Pinned CPU memory holds canonical uint8 indices.
+  Synchronous default-stream copies avoid races with cuBLAS internal streams.
+
+- **Chunked optimizer state streaming** — m/v/scales are stored as pinned CPU
+  tensors grouped into ~100 MB chunks.  During `step()`, each chunk's states
+  are copied to GPU via non-blocking transfers, used by the Triton kernel,
+  then evicted via double-buffered offload-stream DMA (overlaps with the
+  next chunk's compute).
+
+- **Fused C++ CPU AdamW kernel** — A JIT-compiled C++ kernel via `load_inline`
+  runs quantized AdamW directly on CPU flat pinned buffers.  Currently too
+  slow for standalone use (~2.3s/step vs ~0.08s GPU Triton on BERT-base) but
+  preserved for future training-loop overlap.
+
+### Benchmarked Results
+
+Measured on a Quadro T1000 (3.6 GB), batch=2 for BERT-large:
+
+| Model | Offload | Peak VRAM | Throughput |
+|-------|---------|-----------|------------|
+| BERT-base (0.1B) | off | 1.65 GB | 13.0 sps |
+| BERT-base | on | 1.52 GB (−8%) | 12.9 sps |
+| BERT-large (0.3B) | off | 3.29 GB | 2.0 sps |
+| BERT-large | on | 2.68 GB (−19%) | 1.4 sps |
+
+For BERT-base the savings are modest (~130 MB) since W_p is only 56 MB.
+On a 7B model, W_p alone would save ~3.7 GB of GPU VRAM.  The BERT-large
+throughput regression (−30%) is bounded by per-chunk stream synchronization;
+training-loop restructuring to overlap GPU compute with CPU DMA would
+recover this.
 
 ## Testing
 
@@ -301,6 +353,7 @@ python -m tests.harness                    # All methods, 5 epochs
 python -m tests.harness --all              # Same — explicit full comparison
 python -m tests.harness --quick            # 10-batch quick check
 python -m tests.harness --method=phr       # PHR only
+python -m tests.harness --method=phr --offload  # PHR with CPU offloading
 python -m tests.harness --epochs=3         # Custom epoch count
 ```
 
@@ -312,21 +365,23 @@ python -m tests.analyzer                   # Tables + charts in results/_analysi
 
 ## Roadmap
 
-Features planned but not yet implemented:
+Features implemented:
 
-- **CPU offloading** — Set `offload=True` in `PHRConfig`.  Frozen W_p indices
-  are streamed from pinned CPU RAM via a GPU buffer pool.  Optimizer m/v/scales
-  are stored as individual pinned CPU tensors and streamed per-param during
-  `step()` — peak GPU memory for optimizer states is bounded at O(max_param_size)
-  instead of O(total_states).
+- **CPU offloading** — ✅ Set `offload=True` in `PHRConfig`.  Frozen W_p
+  indices are streamed from pinned CPU RAM via a GPU buffer pool.  Optimizer
+  m/v/scales are stored as individual pinned CPU tensors and streamed in
+  ~100 MB chunks during `step()`.  Double-buffered offload-stream eviction
+  DMA overlaps with the next chunk's compute.  Fused C++ CPU AdamW kernel
+  is JIT-compiled for future training-loop overlap work.
   ```python
   config = PHRConfig(offload=True)
   model = compress_model(model, config)
   ```
-  The harness supports it via `--offload`:
   ```bash
   python -m tests.harness --method=phr --offload
   ```
+
+Features planned but not yet implemented:
 
 - **4-bit packed quantization** — sub-8-bit codebooks (16-entry LUT) with
   nibble-packed W_p for further VRAM reduction on output layers.
