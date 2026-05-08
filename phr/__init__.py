@@ -4,7 +4,7 @@ PHR — Packed Hybrid Residual for memory-efficient neural network training.
 Usage:
     from phr import compress_model, PHRConfig
 
-    config = PHRConfig(scheme="phr", learnable_lut=True)
+    config = PHRConfig(scheme="phr", learnable_lut=True, offload=True)
     model = AutoModelForSequenceClassification.from_pretrained("bert-base-uncased")
     model = compress_model(model, config)
     # train normally with standard PyTorch / HuggingFace loop

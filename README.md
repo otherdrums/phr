@@ -314,30 +314,18 @@ python -m tests.analyzer                   # Tables + charts in results/_analysi
 
 Features planned but not yet implemented:
 
-- **CPU offloading** — W_p is frozen and read-only (never written after init),
-  so only one layer's indices need to live on GPU at a time; the rest can stay
-  in system RAM. Combined with optimizer state offload (m/v only touched at
-  step boundaries), GPU VRAM for each component drops from `Σ S_i` to `max(S_i)`
-  where `S_i` is the byte size of layer i. For an L-layer model this eliminates
-  `(L−1)/L` of the static GPU memory footprint with no training slowdown.
-
-  Set `offload_level` in `PHRConfig`:
-  - `offload_level=0` — No offloading (default, all GPU-resident)
-  - `offload_level=1` — W_p streaming from pinned CPU RAM via double-buffered
-    async transfers. GPU holds ≤2 layers' W_p simultaneously.
-  - `offload_level=2` — Level 1 + optimizer state storage offload.
-    int8 m/v live on CPU, prefetched to GPU only during `step()`.
-  - `offload_level=3` — Level 1 + optimizer compute offload.
-    AdamW update runs entirely on CPU, freeing GPU for the next forward pass.
-
+- **CPU offloading** — Set `offload=True` in `PHRConfig`.  Frozen W_p indices
+  are streamed from pinned CPU RAM via a GPU buffer pool.  Optimizer m/v/scales
+  are stored as individual pinned CPU tensors and streamed per-param during
+  `step()` — peak GPU memory for optimizer states is bounded at O(max_param_size)
+  instead of O(total_states).
   ```python
-  config = PHRConfig(offload_level=1, wp_prefetch_depth=1)
+  config = PHRConfig(offload=True)
   model = compress_model(model, config)
   ```
-
-  The harness supports it via `--offload=N`:
+  The harness supports it via `--offload`:
   ```bash
-  python -m tests.harness --method=phr --offload=1
+  python -m tests.harness --method=phr --offload
   ```
 
 - **4-bit packed quantization** — sub-8-bit codebooks (16-entry LUT) with

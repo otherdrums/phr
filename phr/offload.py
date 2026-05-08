@@ -1,13 +1,17 @@
 """
 OffloadManager — GPU↔CPU streaming for PHR training parameters.
 
-Offload levels:
-  0  No offloading.  All tensors GPU-resident (default PHR).
-  1  W_p streaming.  Frozen uint8 indices live in pinned CPU RAM.
-     GPU buffer pool limits concurrent GPU memory to O(prefetch_depth).
-  2  Level 1 + optimizer state storage offload.  Flat pinned CPU
-     buffers enable batched GPU↔CPU transfers (O(1) copies/step).
-  3  Level 1 + optimizer compute offload.  AdamW runs on CPU.
+W_p streaming:  frozen uint8 indices live in pinned CPU RAM.
+               GPU buffer pool limits concurrent GPU memory to O(1) layers.
+               Copies run synchronously on the default stream to avoid
+               races with cuBLAS internal streams.
+
+Optimizer state streaming:  m, v, and per-block scales are stored as
+               individual pinned CPU tensors.  During optimizer.step(),
+               each param's states are prefetched to GPU just before its
+               Triton kernel launch and evicted immediately after —
+               peak GPU memory for optimizer states is bounded at
+               O(max_param_size), not O(total_states).
 """
 
 import torch
@@ -20,28 +24,25 @@ class OffloadManager:
         if not torch.cuda.is_available():
             raise RuntimeError("OffloadManager requires CUDA")
 
-        self._stream = torch.cuda.Stream()
         self._prefetch_depth = max(prefetch_depth, 0)
 
         # --- W_p tracking ---
         self._cpu_buffers = {}       # name → pinned CPU tensor (canonical copy)
         self._wp_params = {}         # name → nn.Parameter reference
         self._wp_devices = {}        # name → target CUDA device
-        self._prefetch_buffers = {}  # name → (gpu_tensor, event) — in-flight
+        self._prefetch_buffers = {}  # name → gpu_tensor — in-flight (sync copy)
         self._on_gpu = set()         # names currently GPU-resident
-
-        # GPU buffer pool for W_p (reuse instead of re-allocate)
-        self._wp_gpu_pool = []       # list of free GPU tensors
+        self._wp_gpu_pool = []       # list of free GPU tensors for reuse
 
         # --- Layer ordering for prefetch scheduling ---
         self._layer_seq = []
         self._layer_index = {}
 
-        # --- Optimizer state offloading (level 2+) ---
-        # Flat pinned CPU buffers (one per state type)
-        self._opt_flat_cpu = {}      # key → pinned CPU tensor
-        # Per-param offsets into flat buffers
-        self._opt_offsets = {}       # pid → {key: (offset, size)}
+        # --- Optimizer state streaming ---
+        # _opt_state_cpu[pid] = {"m": pinned_tensor, "v": pinned_tensor,
+        #                         "m_scale": pinned_tensor, "v_scale": pinned_tensor}
+        self._opt_state_cpu = {}
+        self._opt_offsets = None  # set to True when initialized
 
     # ═══════════════════════════════════════════════════════════════
     # W_p registration & lifecycle
@@ -73,16 +74,12 @@ class OffloadManager:
         """Get a GPU tensor with canonical W_p data.
 
         Reuses a pooled buffer of matching shape, or allocates new.
-        Copy runs on the offload stream; default stream waits via
-        stream dependency to prevent races with the matmul.
+        Copy runs synchronously on the default stream.
         """
-        # Pop a matching-shape buffer from the pool
         for i, gpu in enumerate(self._wp_gpu_pool):
             if gpu.shape == cpu_buf.shape:
                 self._wp_gpu_pool.pop(i)
-                with torch.cuda.stream(self._stream):
-                    gpu.copy_(cpu_buf, non_blocking=True)
-                torch.cuda.current_stream().wait_stream(self._stream)
+                gpu.copy_(cpu_buf)
                 return gpu
         return cpu_buf.to(target_device)
 
@@ -91,10 +88,9 @@ class OffloadManager:
         max_pool = max(self._prefetch_depth + 2, 3)
         if len(self._wp_gpu_pool) < max_pool:
             self._wp_gpu_pool.append(gpu_tensor)
-        # (otherwise let Python GC free it)
 
     def prefetch_wp(self, name):
-        """Synchronous CPU→GPU copy for W_p[name].  Runs on default stream."""
+        """Synchronous CPU→GPU copy for W_p[name]."""
         if name in self._on_gpu or name in self._prefetch_buffers:
             return
         if name not in self._cpu_buffers or name not in self._wp_params:
@@ -113,16 +109,16 @@ class OffloadManager:
         else:
             gpu_tensor.copy_(cpu_buf)
 
-        self._prefetch_buffers[name] = (gpu_tensor, None)
+        self._prefetch_buffers[name] = gpu_tensor
 
     def ensure_wp(self, name):
-        """Ensure W_p[name] is on GPU.  Schedules prefetch of nearby layers."""
+        """Ensure W_p[name] is on GPU.  Schedules prefetch of upcoming layers."""
         if name in self._on_gpu:
             self._schedule_prefetch(name)
             return
 
         if name in self._prefetch_buffers:
-            gpu_tensor, _ = self._prefetch_buffers.pop(name)
+            gpu_tensor = self._prefetch_buffers.pop(name)
             self._wp_params[name].data = gpu_tensor
             self._on_gpu.add(name)
             self._schedule_prefetch(name)
@@ -153,11 +149,6 @@ class OffloadManager:
         return _cb
 
     def _schedule_prefetch(self, current_name):
-        """Prefetch W_p for layers following current_name (forward order).
-
-        Called from ensure_wp to keep the next prefetch_depth layers
-        streaming onto GPU while the current layer's matmul runs.
-        """
         idx = self._layer_index.get(current_name, -1)
         if idx < 0:
             return
@@ -166,48 +157,19 @@ class OffloadManager:
             if nxt < len(self._layer_seq):
                 self.prefetch_wp(self._layer_seq[nxt])
 
-    def sync(self):
-        self._stream.synchronize()
+    # ═══════════════════════════════════════════════════════════════
+    # Optimizer state streaming  (per-param, no flat GPU buffer)
+    # ═══════════════════════════════════════════════════════════════
 
     def _init_opt_offload(self, optimizer):
-        """Pre-allocate flat pinned CPU buffers.  Called from enable_offload."""
-        self._build_opt_flat_buffers(optimizer)
+        """Pre-allocate individual pinned CPU tensors for each param's states.
 
-    def prefetch_first_wp(self):
-        """Prefetch W_p for the first layers in the sequence.
-
-        Called during optimizer.step() so the CPU→GPU copies overlap
-        with the Triton kernel and/or eviction transfers on the offload
-        stream.  When the next forward pass calls ensure_wp for the
-        first layer, the data is already on GPU (no fallback copy).
+        Called from enable_offload() before any optimizer step.
+        After this, _init_state should not use GPU memory.
         """
-        for d in range(self._prefetch_depth):
-            if d < len(self._layer_seq):
-                self.prefetch_wp(self._layer_seq[d])
-
-    # ═══════════════════════════════════════════════════════════════
-    # Optimizer state offloading  (level 2)
-    # ═══════════════════════════════════════════════════════════════
-
-    def _build_opt_flat_buffers(self, optimizer):
-        """One-time init: pre-allocate flat pinned CPU buffers from param sizes.
-
-        Called during enable_offload (before any step).  Allocates pinned
-        CPU tensors for m, v, m_scale, v_scale and assigns per-param CPU
-        views into optimizer.state.  No GPU memory is touched.
-        """
-        block_size = 256
-        for group in optimizer.param_groups:
-            if "block_size" in group:
-                block_size = group["block_size"]
-                break
-
-        sizes_m = []
-        sizes_v = []
-        sizes_ms = []
-        sizes_vs = []
-        pids = []
-        param_map = {}  # pid → param tensor
+        if self._opt_offsets is not None:
+            return  # already initialized
+        self._opt_offsets = True
 
         for group in optimizer.param_groups:
             for p in group["params"]:
@@ -215,247 +177,28 @@ class OffloadManager:
                     continue
                 pid = id(p)
                 N = p.numel()
-                nb = (N + block_size - 1) // block_size
-                sizes_m.append(N)
-                sizes_v.append(N)
-                sizes_ms.append(nb)
-                sizes_vs.append(nb)
-                pids.append(pid)
-                param_map[pid] = p
+                block = group.get("block_size", 256)
+                nb = (N + block - 1) // block
+                self._opt_state_cpu[pid] = {
+                    "m":       torch.zeros(N,  dtype=torch.int8,    pin_memory=True),
+                    "v":       torch.zeros(N,  dtype=torch.int8,    pin_memory=True),
+                    "m_scale": torch.ones(nb,  dtype=torch.float32, pin_memory=True),
+                    "v_scale": torch.ones(nb,  dtype=torch.float32, pin_memory=True),
+                }
 
-        if not sizes_m:
+    def prefetch_param_states(self, state, pid, device):
+        """Copy this param's states from pinned CPU to GPU."""
+        cpu = self._opt_state_cpu.get(pid)
+        if cpu is None:
             return
-
-        offsets_m = [0]; _o = 0
-        for s in sizes_m[:-1]: _o += s; offsets_m.append(_o)
-        offsets_v = [0]; _o = 0
-        for s in sizes_v[:-1]: _o += s; offsets_v.append(_o)
-        offsets_ms = [0]; _o = 0
-        for s in sizes_ms[:-1]: _o += s; offsets_ms.append(_o)
-        offsets_vs = [0]; _o = 0
-        for s in sizes_vs[:-1]: _o += s; offsets_vs.append(_o)
-
-        total_m  = offsets_m[-1]  + sizes_m[-1]  if sizes_m  else 0
-        total_v  = offsets_v[-1]  + sizes_v[-1]  if sizes_v  else 0
-        total_ms = offsets_ms[-1] + sizes_ms[-1] if sizes_ms else 0
-        total_vs = offsets_vs[-1] + sizes_vs[-1] if sizes_vs else 0
-
-        flat_m  = torch.zeros(total_m,  dtype=torch.int8,    pin_memory=True)
-        flat_v  = torch.zeros(total_v,  dtype=torch.int8,    pin_memory=True)
-        flat_ms = torch.ones(total_ms,  dtype=torch.float32, pin_memory=True)
-        flat_vs = torch.ones(total_vs,  dtype=torch.float32, pin_memory=True)
-
-        for i, pid in enumerate(pids):
-            om, sm  = offsets_m[i],  sizes_m[i]
-            ov, sv  = offsets_v[i],  sizes_v[i]
-            oms, sms = offsets_ms[i], sizes_ms[i]
-            ovs, svs = offsets_vs[i], sizes_vs[i]
-
-            self._opt_offsets[pid] = {
-                "m": (om, sm), "v": (ov, sv),
-                "m_scale": (oms, sms), "v_scale": (ovs, svs),
-            }
-
-        self._opt_flat_cpu["m"] = flat_m
-        self._opt_flat_cpu["v"] = flat_v
-        self._opt_flat_cpu["m_scale"] = flat_ms
-        self._opt_flat_cpu["v_scale"] = flat_vs
-
-    def prefetch_optim_states(self, optimizer):
-        """Batched CPU→GPU transfer for all optimizer states.
-
-        First call builds flat pinned CPU buffers.  Subsequent calls
-        allocate a fresh flat GPU buffer (sync copy) and assign per-param
-        GPU views.
-        """
-        if not self._opt_flat_cpu:
-            self._build_opt_flat_buffers(optimizer)
-        if not self._opt_flat_cpu:
-            return
-
-        device = None
-        for group in optimizer.param_groups:
-            for p in group["params"]:
-                if p.device.type == "cuda":
-                    device = p.device
-                    break
-            if device is not None:
-                break
-        if device is None:
-            return
-
-        self._flat_gpu = {}
         for key in ("m", "v", "m_scale", "v_scale"):
-            flat_cpu = self._opt_flat_cpu[key]
-            flat_gpu = flat_cpu.to(device)
-            self._flat_gpu[key] = flat_gpu
-            for group in optimizer.param_groups:
-                for p in group["params"]:
-                    off = self._opt_offsets.get(id(p))
-                    if off is None:
-                        continue
-                    start, size = off[key]
-                    state = optimizer.state[p]
-                    state[key] = flat_gpu[start : start + size]
+            state[key] = cpu[key].to(device)
 
-    def evict_optim_states(self, optimizer):
-        """Batched GPU→CPU sync copy for all optimizer states.
-
-        First step: builds flat buffers (sync via _build).
-        Subsequent steps: copies flat GPU → pinned CPU (synchronous,
-        no async overlap overhead).  The flat GPU buffer is freed
-        immediately after copy, keeping GPU VRAM low.
-        """
-        if not self._opt_flat_cpu:
-            self._build_opt_flat_buffers(optimizer)
+    def evict_param_states(self, state, pid):
+        """Copy this param's states from GPU to pinned CPU, free GPU memory."""
+        cpu = self._opt_state_cpu.get(pid)
+        if cpu is None:
             return
-
-        flat_gpu = getattr(self, '_flat_gpu', None) or {}
-        if not flat_gpu:
-            return
-
-        # Synchronous GPU→CPU copy — no overlap, but frees VRAM immediately
         for key in ("m", "v", "m_scale", "v_scale"):
-            if key in flat_gpu:
-                self._opt_flat_cpu[key].copy_(flat_gpu[key])
-
-        # Free flat GPU buffers now (next prefetch re-allocates)
-        self._flat_gpu = {}
-
-        # Assign per-param CPU views
-        for key in ("m", "v", "m_scale", "v_scale"):
-            flat_cpu = self._opt_flat_cpu[key]
-            for group in optimizer.param_groups:
-                for p in group["params"]:
-                    off = self._opt_offsets.get(id(p))
-                    if off is None:
-                        continue
-                    start, size = off[key]
-                    state = optimizer.state[p]
-                    state[key] = flat_cpu[start : start + size]
-
-        # Clean up any stale async state from previous designs
-        if getattr(self, '_evict_pending', False):
-            self._evict_event.synchronize()
-            self._evict_pending = False
-            self._old_flat_gpu = None
-
-    def finalize_opt_offload(self, optimizer=None):
-        """Ensure all flat GPU buffers are freed.
-
-        Args:
-            optimizer: If provided, per-param state views are replaced
-                       with CPU views (freeing GPU memory).
-        """
-        # Clean up any stale async state
-        if getattr(self, '_evict_pending', False):
-            self._evict_event.synchronize()
-            self._evict_pending = False
-        self._old_flat_gpu = None
-        self._flat_gpu = {}
-
-        if optimizer is not None:
-            for key in ("m", "v", "m_scale", "v_scale"):
-                flat_cpu = self._opt_flat_cpu.get(key)
-                if flat_cpu is None:
-                    continue
-                for group in optimizer.param_groups:
-                    for p in group["params"]:
-                        off = self._opt_offsets.get(id(p))
-                        if off is None:
-                            continue
-                        start, size = off[key]
-                        state = optimizer.state[p]
-                        state[key] = flat_cpu[start : start + size]
-
-            torch.cuda.empty_cache()
-
-    # ═══════════════════════════════════════════════════════════════
-    # Optimizer compute offload  (level 3)
-    # ═══════════════════════════════════════════════════════════════
-
-    def compute_optim_step_cpu(self, optimizer, bias_correction1, bias_correction2):
-        """Run the quantized AdamW update entirely on CPU."""
-        for group in optimizer.param_groups:
-            lr = group["lr"]
-            beta1, beta2 = group["betas"]
-            eps = group["eps"]
-            wd = group["weight_decay"]
-            block_size = group["block_size"]
-
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                state = optimizer.state.get(p)
-                if state is None or "m" not in state:
-                    continue
-
-                pid = id(p)
-                off = self._opt_offsets.get(pid)
-                if off is None:
-                    continue
-
-                flat_m = self._opt_flat_cpu["m"]
-                flat_v = self._opt_flat_cpu["v"]
-                flat_ms = self._opt_flat_cpu["m_scale"]
-                flat_vs = self._opt_flat_cpu["v_scale"]
-
-                # Ensure latest param + grad on CPU
-                p_cpu = torch.empty(p.data.size(), dtype=p.data.dtype, pin_memory=True)
-                g_cpu = torch.empty(p.grad.size(), dtype=p.grad.dtype, pin_memory=True)
-                p_cpu.copy_(p.data)
-                g_cpu.copy_(p.grad)
-
-                m_start, m_size = off["m"]
-                v_start, v_size = off["v"]
-                ms_start, ms_size = off["m_scale"]
-                vs_start, vs_size = off["v_scale"]
-
-                m_i8 = flat_m[m_start : m_start + m_size]
-                v_i8 = flat_v[v_start : v_start + v_size]
-                m_scale = flat_ms[ms_start : ms_start + ms_size]
-                v_scale = flat_vs[vs_start : vs_start + vs_size]
-
-                N = p_cpu.numel()
-                num_blocks = (N + block_size - 1) // block_size
-
-                p_flat = p_cpu.float().flatten()
-                g_flat = g_cpu.float().flatten()
-
-                for blk in range(num_blocks):
-                    lo = blk * block_size
-                    hi = min(lo + block_size, N)
-
-                    gg = g_flat[lo:hi]
-
-                    m_blk = m_i8[lo:hi].float() * m_scale[blk]
-                    v_blk = v_i8[lo:hi].float() * v_scale[blk]
-
-                    if wd > 0.0:
-                        p_flat[lo:hi] -= lr * wd * p_flat[lo:hi]
-
-                    m_new = beta1 * m_blk + (1.0 - beta1) * gg
-                    v_new = beta2 * v_blk + (1.0 - beta2) * gg * gg
-
-                    m_absmax = m_new.abs().max()
-                    v_absmax = v_new.abs().max()
-                    new_m_scale = max(m_absmax.item() / 127.0, 1e-14)
-                    new_v_scale = max(v_absmax.item() / 127.0, 1e-10)
-
-                    m_rounded = torch.where(
-                        m_new >= 0.0,
-                        m_new / new_m_scale + 0.5,
-                        m_new / new_m_scale - 0.5,
-                    )
-                    m_i8[lo:hi] = torch.clamp(m_rounded.to(torch.int8), -127, 127)
-                    v_rounded = (v_new / new_v_scale + 0.5)
-                    v_i8[lo:hi] = torch.clamp(v_rounded.to(torch.int8), 1, 127)
-
-                    m_hat = m_new / bias_correction1
-                    v_hat = v_new / bias_correction2
-                    p_flat[lo:hi] -= lr * m_hat / (torch.sqrt(v_hat) + eps)
-
-                    m_scale[blk] = new_m_scale
-                    v_scale[blk] = new_v_scale
-
-                p.data.copy_(p_flat.reshape(p.data.shape))
+            cpu[key].copy_(state[key])
+            state[key] = state[key].cpu()

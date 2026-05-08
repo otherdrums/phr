@@ -4,8 +4,8 @@ FusedQuantizedAdam — 8-bit AdamW optimizer powered by Triton.
 Stores optimizer moment buffers (m, v) as int8 with per-block scales.
 ~75% memory reduction vs standard Adam (2 bytes/param vs 8 bytes/param).
 
-The Triton kernel handles dequantize → update → requantize → param update
-in a single launch per parameter tensor.
+When offloading is enabled, m/v/scales are stored in pinned CPU memory
+and streamed to GPU one param at a time during step().
 """
 
 import torch
@@ -106,19 +106,13 @@ class FusedQuantizedAdam(torch.optim.Optimizer):
         super().__init__(params, defaults)
         self._step_count = 0
         self._offload_mgr = None
-        self._offload_level = 0
+        self._offload_enabled = False
 
-    def enable_offload(self, manager, level):
-        """Connect to an OffloadManager for optimizer state streaming.
-
-        Args:
-            manager: OffloadManager instance (attached to model).
-            level:   Offload level (2 = storage offload, 3 = compute offload).
-        """
+    def enable_offload(self, manager):
+        """Connect to an OffloadManager for optimizer state streaming."""
         self._offload_mgr = manager
-        self._offload_level = level
-        if level >= 2:
-            manager._init_opt_offload(self)
+        self._offload_enabled = True
+        manager._init_opt_offload(self)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -140,17 +134,6 @@ class FusedQuantizedAdam(torch.optim.Optimizer):
             bias1 = 1.0 - beta1 ** step
             bias2 = 1.0 - beta2 ** step
 
-            # ── Level 3: CPU-side AdamW (entire step on CPU) ──
-            if self._offload_level >= 3 and self._offload_mgr is not None:
-                self._offload_mgr.compute_optim_step_cpu(
-                    self, bias1, bias2,
-                )
-                continue
-
-            # ── Level 2: prefetch all optimizer states to GPU once per step ──
-            if self._offload_level >= 2 and self._offload_mgr is not None:
-                self._offload_mgr.prefetch_optim_states(self)
-
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -161,9 +144,12 @@ class FusedQuantizedAdam(torch.optim.Optimizer):
 
                 state = self.state[p]
 
-                # Skip _init_state when offloading — flat buffers pre-allocated
                 if "m" not in state:
-                    _init_state(state, p, block)
+                    _init_state(state, p, block, offload=self._offload_enabled)
+
+                # ── Per-param offload: prefetch states CPU → GPU ──
+                if self._offload_enabled:
+                    self._offload_mgr.prefetch_param_states(state, id(p), p.device)
 
                 p_data = p.data.contiguous()
                 g_data = grad.contiguous()
@@ -193,13 +179,9 @@ class FusedQuantizedAdam(torch.optim.Optimizer):
                 if p.data.data_ptr() != p_data.data_ptr():
                     p.data.copy_(p_data)
 
-            # ── Level 2: evict all optimizer states back to CPU once per step ──
-            if self._offload_level >= 2 and self._offload_mgr is not None:
-                self._offload_mgr.evict_optim_states(self)
-
-            # ── Level 1: fire W_p prefetches for next forward ──
-            if self._offload_level >= 1 and self._offload_mgr is not None:
-                self._offload_mgr.prefetch_first_wp()
+                # ── Per-param offload: evict states GPU → CPU ──
+                if self._offload_enabled:
+                    self._offload_mgr.evict_param_states(state, id(p))
 
         return loss
 

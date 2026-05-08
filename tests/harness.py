@@ -140,7 +140,7 @@ def _cleanup():
     torch.cuda.synchronize()
 
 
-def run(quick=False, method_filter=None, epochs=5, offload_level=0):
+def run(quick=False, method_filter=None, epochs=5, offload=False):
     cfg = TrainingConfig(epochs=epochs)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -201,7 +201,7 @@ def run(quick=False, method_filter=None, epochs=5, offload_level=0):
             # Suppress model loading progress bars (stderr)
             with redirect_stderr(io.StringIO()):
                 if method_key == "phr":
-                    model, prebuilt_opt = build_fn(offload_level=offload_level)
+                    model, prebuilt_opt = build_fn(offload=offload)
                 else:
                     model, prebuilt_opt = build_fn()
             # Skip model.to() when offloading — compress_model handles CUDA move
@@ -327,7 +327,7 @@ def run(quick=False, method_filter=None, epochs=5, offload_level=0):
                 "trainable_params_m": trainable / 1e6,
                 "total_time_s": total_time,
                 "epochs": EPOCHS,
-                "offload_level": offload_level if method_key == "phr" else None,
+                "offload": offload,
                 "format_version": 1,
                 "training_config": cfg.to_dict(),
             }, idle_vram)
@@ -384,16 +384,14 @@ def _print_table(entries):
 if __name__ == "__main__":
     quick = "--quick" in sys.argv
     run_all = "--all" in sys.argv
+    offload = "--offload" in sys.argv
     method_filter = None
     epochs = 5
-    offload_level = 0
     for arg in sys.argv:
         if arg.startswith("--method="):
             method_filter = arg.split("=")[1]
         elif arg.startswith("--epochs="):
             epochs = int(arg.split("=")[1])
-        elif arg.startswith("--offload="):
-            offload_level = int(arg.split("=")[1])
     if run_all:
         method_filter = None
-    run(quick=quick, method_filter=method_filter, epochs=epochs, offload_level=offload_level)
+    run(quick=quick, method_filter=method_filter, epochs=epochs, offload=offload)

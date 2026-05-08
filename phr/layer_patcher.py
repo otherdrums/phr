@@ -40,13 +40,12 @@ def compress_model(model: nn.Module, config: PHRConfig = None):
     if config.gradient_checkpointing:
         _enable_gradient_checkpointing(model)
 
-    if config.offload_level >= 1 and phr_layers:
+    if config.offload and phr_layers:
         # Model must be on CUDA before we can capture W_p for offloading.
-        # If not already, move it now (subsequent .cuda() calls are no-ops).
         if next(model.parameters()).is_cpu:
             model.cuda()
 
-        mgr = OffloadManager(prefetch_depth=config.wp_prefetch_depth)
+        mgr = OffloadManager(prefetch_depth=1)
         layer_names = []
         for name, phr in phr_layers:
             mgr.register_wp(name, phr.W_p)

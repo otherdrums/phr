@@ -17,12 +17,8 @@ class PHRConfig:
         layer_scope:            Which linear layers to replace
         gradient_checkpointing: Enable gradient checkpointing on the backbone
         use_8bit_optimizer:     Use FusedQuantizedAdam (Triton 8-bit Adam)
-        offload_level:          GPU→CPU offloading aggressiveness:
-                                  0 = none (default, all GPU-resident)
-                                  1 = W_p streaming (frozen indices from pinned CPU)
-                                  2 = + optimizer state storage offload (m/v on CPU)
-                                  3 = + optimizer compute offload (AdamW on CPU)
-        wp_prefetch_depth:      Layers ahead to prefetch W_p (default 1 = double-buffer)
+        offload:                Enable CPU/system RAM offloading
+                                (W_p streaming + optimizer state streaming)
         block_size:             Quantization block size for 8-bit optimizer
     """
 
@@ -31,6 +27,5 @@ class PHRConfig:
     layer_scope: Literal["ffn", "attention", "all"] = "ffn"
     gradient_checkpointing: bool = True
     use_8bit_optimizer: bool = True
-    offload_level: int = 0
-    wp_prefetch_depth: int = 1
+    offload: bool = False
     block_size: int = 256
