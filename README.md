@@ -390,7 +390,7 @@ no hand-tuning.
 from phr import CV2LRTController
 
 # Create controller (captures base LRs automatically)
-cv2lrt = CV2LRTController(optimizer, beta=0.97, min_multiplier=0.1)
+cv2lrt = CV2LRTController(optimizer, beta=0.97, min_multiplier=0.25)
 
 # In training loop:
 for step, batch in enumerate(train_loader):
@@ -462,7 +462,7 @@ Features implemented:
   Configurable granularity (`"matrix"`, `"layer"`, `"coarse"`).
   ```python
   from phr import CV2LRTController
-  cv2lrt = CV2LRTController(optimizer, beta=0.97, min_multiplier=0.1)
+  cv2lrt = CV2LRTController(optimizer, beta=0.97, min_multiplier=0.25)
   # In training loop:
   if step < warmup_steps:
       cv2lrt.warmup_step(step, warmup_steps)

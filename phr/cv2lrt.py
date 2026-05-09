@@ -31,7 +31,7 @@ class CV2LRTController:
         Higher = more smoothing, slower to react.  Default 0.97.
     min_multiplier : float
         Minimum LR multiplier applied when velocity is near zero
-        (layer is saturating).  Default 0.1.
+        (layer is saturating).  Default 0.25.
     max_multiplier : float
         Maximum LR multiplier applied when velocity is high
         (layer is actively learning).  Default 1.0.
@@ -45,7 +45,7 @@ class CV2LRTController:
         self,
         optimizer: torch.optim.Optimizer,
         beta: float = 0.97,
-        min_multiplier: float = 0.1,
+        min_multiplier: float = 0.25,
         max_multiplier: float = 1.0,
         velocity_scale: float = 10.0,
     ):
