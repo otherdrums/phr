@@ -51,7 +51,7 @@ RUN_ID = f"{_COMMIT}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 
 def _save_model(model, method_key, metrics, idle_vram):
-    """Save model, metrics, and PHR-specific layer stats after training."""
+    """Save model, metrics, and baked standard HuggingFace model."""
     import json
     from phr import PHRLinear
 
@@ -66,25 +66,63 @@ def _save_model(model, method_key, metrics, idle_vram):
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
 
-    # PHR-specific: bake to standard model + dump layer stats
+    # Bake to standard HuggingFace model (all methods)
+    _bake_model(model, method_key, out_dir)
+
+    # PHR-specific: dump layer stats
     if method_key == "phr":
         _dump_phr_stats(model, out_dir)
-        _bake_phr(model, out_dir)
 
     print(f"  Saved: {out_dir}")
 
 
-def _bake_phr(model, out_dir):
-    """Materialize PHR weights → standard nn.Linear and save via save_pretrained."""
+def _bake_model(model, method_key, out_dir):
+    """Produce a standard HuggingFace baked/ model from the trained model."""
     import torch.nn as nn
     from phr import PHRLinear
 
-    # Clone to avoid mutating the original
-    baked = model
+    baked_dir = os.path.join(out_dir, "baked")
+    os.makedirs(baked_dir, exist_ok=True)
+
+    if method_key == "phr":
+        _bake_phr(model, out_dir)
+    elif method_key in ("lora", "qlora"):
+        try:
+            merged = model.merge_and_unload()
+            merged.save_pretrained(baked_dir)
+        except Exception:
+            # bitsandbytes merged model .state_dict() may fail — build clean model
+            from transformers import BertForSequenceClassification
+            merged = model.merge_and_unload()
+            clean = BertForSequenceClassification.from_pretrained(
+                "bert-base-uncased", num_labels=2, ignore_mismatched_sizes=True,
+                local_files_only=True,
+            )
+            merged_sd = {}
+            for name, param in merged.named_parameters():
+                merged_sd[name] = param.detach().cpu().clone()
+            for name, buf in merged.named_buffers():
+                merged_sd[name] = buf.detach().cpu().clone()
+            clean.load_state_dict(merged_sd, strict=False)
+            clean.save_pretrained(baked_dir)
+        print(f"  Baked standard model: {baked_dir}")
+    else:
+        model.save_pretrained(baked_dir)
+        print(f"  Baked standard model: {baked_dir}")
+
+
+def _bake_phr(model, out_dir):
+    """Materialize PHR weights → standard nn.Linear and save via save_pretrained."""
+    import copy
+    import torch.nn as nn
+    from phr import PHRLinear
+
+    baked_dir = os.path.join(out_dir, "baked")
+    os.makedirs(baked_dir, exist_ok=True)
+    baked = copy.deepcopy(model)
 
     for name, module in list(baked.named_modules()):
         if isinstance(module, PHRLinear):
-            # Materialize
             w_full = (module.W_f + module.lut[module.W_p.long()]).t().contiguous()
             linear = nn.Linear(module.in_features, module.out_features,
                               bias=module.bias_f is not None)
@@ -98,7 +136,6 @@ def _bake_phr(model, out_dir):
                 parent = getattr(parent, part)
             setattr(parent, parts[-1], linear)
 
-    baked_dir = os.path.join(out_dir, "baked")
     baked.save_pretrained(baked_dir)
     print(f"  Baked standard model: {baked_dir}")
 

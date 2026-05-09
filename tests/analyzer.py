@@ -30,6 +30,7 @@ class RunData:
     total_time_s: float = 0.0
     epochs: int = 5
     idle_vram_mb: float = 0.0
+    offload: bool = False
     training_config: dict = field(default_factory=dict)
     layer_stats: dict = field(default_factory=dict)
 
@@ -86,6 +87,7 @@ def load_runs(results_dir: Path) -> list[RunData]:
             total_time_s=metrics.get("total_time_s", 0),
             epochs=metrics.get("epochs", 5),
             idle_vram_mb=metrics.get("idle_vram_mb", 0),
+            offload=metrics.get("offload", False),
             training_config=metrics.get("training_config", {}),
         )
 
@@ -129,8 +131,8 @@ def generate_comparison_table(runs: list[RunData]) -> str:
     lines = [
         "## Method Comparison (sorted by validation accuracy)",
         "",
-        "| Method | Val Acc | Train Acc | VRAM (GB) | Params (M) | Time (h) | Acc/GB | Acc/M | ",
-        "|--------|--------:|----------:|:--------:|:---------:|:--------:|:------:|:-----:|",
+        "| Method | Val Acc | Train Acc | VRAM (GB) | Params (M) | Time (h) | Offload | Acc/GB | Acc/M | ",
+        "|--------|--------:|----------:|:--------:|:---------:|:--------:|:------:|:------:|:-----:|",
     ]
 
     best_val = max(r.val_acc for r in sorted_runs)
@@ -141,10 +143,11 @@ def generate_comparison_table(runs: list[RunData]) -> str:
         val = f"{_b(f'{rd.val_acc:.2f}%')}" if rd.val_acc == best_val else f"{rd.val_acc:.2f}%"
         vram = f"{_b(f'{rd.peak_vram_gb:.2f}')}" if rd.peak_vram_gb == best_vram else f"{rd.peak_vram_gb:.2f}"
         eff = f"{_b(f'{rd.acc_per_gb:.1f}')}" if rd.acc_per_gb == best_efficiency else f"{rd.acc_per_gb:.1f}"
+        off = "✓" if rd.offload else "—"
         line = (
             f"| {rd.method} | {val} | {rd.train_acc:.2f}% | "
             f"{vram} GB | {rd.trainable_params_m:.1f}M | "
-            f"{rd.total_time_s / 3600:.2f} | {eff} | {rd.acc_per_m_params:.2f} |"
+            f"{rd.total_time_s / 3600:.2f} | {off} | {eff} | {rd.acc_per_m_params:.2f} |"
         )
         lines.append(line)
 
@@ -283,6 +286,7 @@ def generate_json_summary(runs: list[RunData]) -> dict:
                 "total_time_s": r.total_time_s,
                 "total_time_h": round(r.total_time_s / 3600, 2),
                 "epochs": r.epochs,
+                "offload": r.offload,
                 "acc_per_gb": round(r.acc_per_gb, 2),
                 "acc_per_m_params": round(r.acc_per_m_params, 2),
                 "samples_per_sec": round(r.samples_per_sec, 1),
