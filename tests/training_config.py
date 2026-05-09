@@ -48,7 +48,7 @@ class TrainingConfig:
     # ── CV2LRT adaptive scheduler ──
     cv2lrt_enabled: bool = False
     cv2lrt_beta: float = 0.97
-    cv2lrt_min_multiplier: float = 0.25
+    cv2lrt_min_multiplier: float = 0.175
     cv2lrt_max_multiplier: float = 1.0
     cv2lrt_velocity_scale: float = 10.0
     cv2lrt_granularity: str = "matrix"   # "coarse" | "layer" | "matrix"
