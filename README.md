@@ -346,6 +346,90 @@ throughput regression (−30%) is bounded by per-chunk stream synchronization;
 training-loop restructuring to overlap GPU compute with CPU DMA would
 recover this.
 
+## CV2LRT — Adaptive Per-Layer LR Scheduling
+
+> **Experimental — on `feature/cv2lrt` branch.**  Not yet merged to `master`.
+> See [feature/cv2lrt](https://github.com/otherdrums/phr/tree/feature/cv2lrt).
+
+CV2LRT (Continuous Velocity to Learning Rate Translation) is a closed-loop
+adaptive learning rate controller that replaces hand-tuned schedules entirely.
+It reads the AdamW second-moment buffer (`exp_avg_sq`, the "v" state) every
+optimizer step, extracts a real-time signal of how quickly each layer is
+learning, and dynamically adjusts per-layer learning rates without pausing
+or wasting steps.
+
+### How It Works
+
+1. **After every `optimizer.step()`**, the CPU reads the freshly-updated
+   `exp_avg_sq` tensor for each parameter and computes its mean.
+
+2. **Velocity computation**: `Δv = v_mean_current − v_mean_previous` captures
+   whether the layer's gradients are still climbing (active learning) or have
+   flattened out (saturation).
+
+3. **EMA low-pass filter**: The raw step-to-step `Δv` is noisy (SGD is
+   stochastic — every micro-batch has different data).  An EMA with β=0.97
+   (half-life ~23 steps) smooths out micro-batch jitter, producing a clean
+   velocity signal.
+
+4. **Normalize**: Divide the EMA velocity by the current `v_mean` to get the
+   *relative* rate of change — this makes the signal comparable across layers
+   with different weight magnitudes.
+
+5. **Translate to LR multiplier**: `multiplier = clamp(0.1, 1.0, norm_vel × 10)`.
+   When a layer is hungry (high velocity) → multiplier stays at 1.0 (full LR).
+   When a layer saturates (velocity → 0) → multiplier decays to 0.1.
+
+The result: every matrix in the network continuously reads its own internal
+structural stress and adjusts its own learning rate.  No epochs, no schedules,
+no hand-tuning.
+
+### Using CV2LRT
+
+```python
+from phr import CV2LRTController
+
+# Create controller (captures base LRs automatically)
+cv2lrt = CV2LRTController(optimizer, beta=0.97, min_multiplier=0.1)
+
+# In training loop:
+for step, batch in enumerate(train_loader):
+    loss = model(**batch).loss
+    loss.backward()
+
+    if step < warmup_steps:
+        cv2lrt.warmup_step(step, warmup_steps)   # linear warmup
+    elif (step + 1) % acc_steps == 0:
+        optimizer.step()
+        cv2lrt.step()                             # reads v, adjusts LRs
+        optimizer.zero_grad()
+```
+
+Or via the harness:
+
+```bash
+python -m tests.harness --method=phr --cv2lrt
+```
+
+### Granularity
+
+CV2LRT supports three grouping levels for independent LR control:
+
+| Level | Groups (bert-base) | Description |
+|-------|:---:|---|
+| `"matrix"` | ~102 | Each named module gets its own LR |
+| `"layer"` | ~14 | Per-encoder-layer grouping |
+| `"coarse"` | 2 | Body + head (same as current differential LR) |
+
+Set via `TrainingConfig.cv2lrt_granularity` or the `build_phr_cv2lrt()` builder.
+
+### Int8 State Handling
+
+`FusedQuantizedAdam` stores `exp_avg_sq` as int8 with per-block float32
+scales.  CV2LRT auto-detects this format and dequantizes correctly — the
+mean of a block-quantized tensor is mathematically identical to the
+float32 mean, so the velocity signal is lossless.
+
 ## Testing
 
 Run the SST-2 comparison harness:
