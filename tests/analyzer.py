@@ -19,11 +19,14 @@ from dataclasses import dataclass, field, asdict
 @dataclass
 class RunData:
     method: str
+    task: str
+    seed: int
     commit: str
     timestamp: str
     directory: str
     val_acc: float = 0.0
     final_val_acc: float = 0.0
+    val_acc_mismatched: float = 0.0
     train_acc: float = 0.0
     peak_vram_gb: float = 0.0
     trainable_params_m: float = 0.0
@@ -43,17 +46,12 @@ class RunData:
 
 
 def _parse_dirname(dirname: str):
-    """Parse sst2_{method}_seed42_{commit}_{timestamp}"""
-    base = dirname.replace("sst2_", "", 1)
-    parts = base.split("_seed42_", 1)
-    if len(parts) != 2:
-        return None, None, None
-    method = parts[0]
-    suffix = parts[1]
-    suffix_parts = suffix.split("_", 1)
-    commit = suffix_parts[0]
-    timestamp = suffix_parts[1] if len(suffix_parts) > 1 else "19700101_000000"
-    return method, commit, timestamp
+    """Parse {task}_{method}_seed{seed}_{commit}_{timestamp}"""
+    m = re.match(r'^(\w+)_(\w+)_seed(\d+)_([a-f0-9]+)_(\d{8}_\d{6})$', dirname)
+    if not m:
+        return None, None, None, None, None
+    task, method, seed_str, commit, timestamp = m.groups()
+    return task, method, int(seed_str), commit, timestamp
 
 
 def load_runs(results_dir: Path) -> list[RunData]:
@@ -64,7 +62,7 @@ def load_runs(results_dir: Path) -> list[RunData]:
     for d in sorted(results_dir.iterdir()):
         if not d.is_dir():
             continue
-        method, commit, timestamp = _parse_dirname(d.name)
+        task, method, seed, commit, timestamp = _parse_dirname(d.name)
         if method is None:
             continue
 
@@ -76,11 +74,14 @@ def load_runs(results_dir: Path) -> list[RunData]:
 
         rd = RunData(
             method=method,
+            task=task,
+            seed=seed,
             commit=commit,
             timestamp=timestamp,
             directory=str(d),
             val_acc=metrics.get("val_acc", 0),
             final_val_acc=metrics.get("final_val_acc", 0),
+            val_acc_mismatched=metrics.get("val_acc_mismatched", 0),
             train_acc=metrics.get("train_acc", 0),
             peak_vram_gb=metrics.get("peak_vram_gb", 0),
             trainable_params_m=metrics.get("trainable_params_m", 0),
@@ -94,7 +95,8 @@ def load_runs(results_dir: Path) -> list[RunData]:
         # Derived metrics
         rd.acc_per_gb = rd.val_acc / max(rd.peak_vram_gb, 0.01)
         rd.acc_per_m_params = rd.val_acc / max(rd.trainable_params_m, 0.001)
-        rd.samples_per_sec = (42190 * rd.epochs) / max(rd.total_time_s, 1)  # ~42K train samples in SST-2
+        _TRAIN_SAMPLES = {"sst2": 42190, "mnli": 392702}
+        rd.samples_per_sec = (_TRAIN_SAMPLES.get(rd.task, 42190) * rd.epochs) / max(rd.total_time_s, 1)
 
         # Load layer_stats for PHR runs
         layer_path = d / "layer_stats.json"
@@ -131,8 +133,8 @@ def generate_comparison_table(runs: list[RunData]) -> str:
     lines = [
         "## Method Comparison (sorted by validation accuracy)",
         "",
-        "| Method | Val Acc | Train Acc | VRAM (GB) | Params (M) | Time (h) | Offload | Acc/GB | Acc/M | ",
-        "|--------|--------:|----------:|:--------:|:---------:|:--------:|:------:|:------:|:-----:|",
+        "| Method | Task | Val Acc | Train Acc | VRAM (GB) | Params (M) | Time (h) | Offload | Acc/GB | Acc/M | ",
+        "|--------|------|--------:|----------:|:--------:|:---------:|:--------:|:------:|:------:|:-----:|",
     ]
 
     best_val = max(r.val_acc for r in sorted_runs)
@@ -145,7 +147,7 @@ def generate_comparison_table(runs: list[RunData]) -> str:
         eff = f"{_b(f'{rd.acc_per_gb:.1f}')}" if rd.acc_per_gb == best_efficiency else f"{rd.acc_per_gb:.1f}"
         off = "✓" if rd.offload else "—"
         line = (
-            f"| {rd.method} | {val} | {rd.train_acc:.2f}% | "
+            f"| {rd.method} | {rd.task} | {val} | {rd.train_acc:.2f}% | "
             f"{vram} GB | {rd.trainable_params_m:.1f}M | "
             f"{rd.total_time_s / 3600:.2f} | {off} | {eff} | {rd.acc_per_m_params:.2f} |"
         )
@@ -280,6 +282,7 @@ def generate_json_summary(runs: list[RunData]) -> dict:
                 "timestamp": r.timestamp,
                 "val_acc": r.val_acc,
                 "final_val_acc": r.final_val_acc,
+                "val_acc_mismatched": r.val_acc_mismatched,
                 "train_acc": r.train_acc,
                 "peak_vram_gb": r.peak_vram_gb,
                 "trainable_params_m": r.trainable_params_m,
@@ -300,7 +303,7 @@ def generate_json_summary(runs: list[RunData]) -> dict:
         "_notes": {
             "acc_gap_vs_full_pct": "Positive = better than full fine-tune, negative = worse",
             "acc_per_gb": "Val accuracy per GB VRAM — higher = more memory-efficient",
-            "samples_per_sec": "Approximate training throughput (SST-2 train set = ~42190 samples)",
+            "samples_per_sec": "Training throughput (task-specific train set size)",
         },
     }
 
@@ -339,7 +342,7 @@ def plot_val_acc_bar(runs: list[RunData], output_dir: Path):
                 f"{val:.1f}%", ha="center", fontsize=10, fontweight="bold")
 
     ax.set_ylabel("Validation Accuracy (%)")
-    ax.set_title("SST-2 Validation Accuracy by Method")
+    ax.set_title("Validation Accuracy by Method")
     ax.set_ylim(min(vals) - 1.5, max(vals) + 2)
     if full_acc:
         ax.legend(fontsize=8)

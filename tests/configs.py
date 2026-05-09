@@ -10,27 +10,26 @@ from .training_config import TrainingConfig, method_lr_config
 
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
-SHARED_SEED = 42
 _MODEL_KWARGS = {"local_files_only": True}
 _cfg = TrainingConfig()
 
 
-def build_full_finetune():
+def build_full_finetune(num_labels=2, seed=42):
     """Vanilla BERT — all parameters trainable."""
-    torch.manual_seed(SHARED_SEED)
+    torch.manual_seed(seed)
     model = BertForSequenceClassification.from_pretrained(
-        "bert-base-uncased", num_labels=2, ignore_mismatched_sizes=True,
+        "bert-base-uncased", num_labels=num_labels, ignore_mismatched_sizes=True,
         **_MODEL_KWARGS,
     )
     model.gradient_checkpointing_enable()
     return model, None
 
 
-def build_bitfit():
+def build_bitfit(num_labels=2, seed=42):
     """Bias-only fine-tuning — freeze all except biases."""
-    torch.manual_seed(SHARED_SEED)
+    torch.manual_seed(seed)
     model = BertForSequenceClassification.from_pretrained(
-        "bert-base-uncased", num_labels=2, ignore_mismatched_sizes=True,
+        "bert-base-uncased", num_labels=num_labels, ignore_mismatched_sizes=True,
         **_MODEL_KWARGS,
     )
     model.gradient_checkpointing_enable()
@@ -40,13 +39,13 @@ def build_bitfit():
     return model, None
 
 
-def build_lora():
+def build_lora(num_labels=2, seed=42):
     """LoRA adapters on attention Q+V projections, r=8, α=r per Hu et al. 2021."""
     from peft import LoraConfig, get_peft_model
 
-    torch.manual_seed(SHARED_SEED)
+    torch.manual_seed(seed)
     model = BertForSequenceClassification.from_pretrained(
-        "bert-base-uncased", num_labels=2, ignore_mismatched_sizes=True,
+        "bert-base-uncased", num_labels=num_labels, ignore_mismatched_sizes=True,
         **_MODEL_KWARGS,
     )
     model.gradient_checkpointing_enable()
@@ -63,12 +62,12 @@ def build_lora():
     return model, None
 
 
-def build_qlora():
+def build_qlora(num_labels=2, seed=42):
     """8-bit quantized BERT with LoRA adapters, r=8, α=r."""
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
     from transformers import BitsAndBytesConfig
 
-    torch.manual_seed(SHARED_SEED)
+    torch.manual_seed(seed)
 
     bnb_config = BitsAndBytesConfig(
         load_in_8bit=True,
@@ -77,7 +76,7 @@ def build_qlora():
 
     model = BertForSequenceClassification.from_pretrained(
         "bert-base-uncased",
-        num_labels=2,
+        num_labels=num_labels,
         ignore_mismatched_sizes=True,
         quantization_config=bnb_config,
         **_MODEL_KWARGS,
@@ -97,11 +96,11 @@ def build_qlora():
     return model, None
 
 
-def build_phr(offload=False):
+def build_phr(offload=False, num_labels=2, seed=42):
     """PHR-compressed FFN layers with 8-bit Adam."""
-    torch.manual_seed(SHARED_SEED)
+    torch.manual_seed(seed)
     model = BertForSequenceClassification.from_pretrained(
-        "bert-base-uncased", num_labels=2, ignore_mismatched_sizes=True,
+        "bert-base-uncased", num_labels=num_labels, ignore_mismatched_sizes=True,
         **_MODEL_KWARGS,
     )
     phr_cfg = PHRConfig(
@@ -201,11 +200,11 @@ def _param_group_key(name, granularity="matrix"):
     return ".".join(name.split(".")[:-1])
 
 
-def build_phr_cv2lrt(offload=False):
+def build_phr_cv2lrt(offload=False, num_labels=2, seed=42):
     """PHR-compressed FFN layers with per-module parameter groups for CV2LRT."""
-    torch.manual_seed(SHARED_SEED)
+    torch.manual_seed(seed)
     model = BertForSequenceClassification.from_pretrained(
-        "bert-base-uncased", num_labels=2, ignore_mismatched_sizes=True,
+        "bert-base-uncased", num_labels=num_labels, ignore_mismatched_sizes=True,
         **_MODEL_KWARGS,
     )
     phr_cfg = PHRConfig(

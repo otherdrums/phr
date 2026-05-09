@@ -1,4 +1,4 @@
-"""Unified SST-2 fine-tuning comparison harness."""
+"""Unified fine-tuning comparison harness."""
 
 # === Silence everything ===
 import sys, os, gc, io, time, warnings
@@ -30,6 +30,21 @@ from torch.optim.lr_scheduler import LinearLR, SequentialLR, LambdaLR
 from phr.cv2lrt import CV2LRTController
 import math
 
+_TASK_META = {
+    "sst2": {
+        "num_labels": 2,
+        "dataset_name": "sst2",
+        "train_samples": 42190,
+        "val_splits": ["validation"],
+    },
+    "mnli": {
+        "num_labels": 3,
+        "dataset_name": "mnli",
+        "train_samples": 392702,
+        "val_splits": ["validation_matched", "validation_mismatched"],
+    },
+}
+
 
 def _cosine_factor(total_steps: int, min_factor: float):
     """Return a LambdaLR-compatible function: 1.0 → min_factor over total_steps."""
@@ -51,12 +66,12 @@ _COMMIT = subprocess.check_output(
 RUN_ID = f"{_COMMIT}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 
-def _save_model(model, method_key, metrics, idle_vram):
+def _save_model(model, method_key, metrics, idle_vram, num_labels=2, task="sst2", seed=42):
     """Save model, metrics, and baked standard HuggingFace model."""
     import json
     from phr import PHRLinear
 
-    out_dir = os.path.join(RESULTS_DIR, f"sst2_{method_key}_seed42_{RUN_ID}")
+    out_dir = os.path.join(RESULTS_DIR, f"{task}_{method_key}_seed{seed}_{RUN_ID}")
     os.makedirs(out_dir, exist_ok=True)
 
     # Save state dict
@@ -68,7 +83,7 @@ def _save_model(model, method_key, metrics, idle_vram):
         json.dump(metrics, f, indent=2)
 
     # Bake to standard HuggingFace model (all methods)
-    _bake_model(model, method_key, out_dir)
+    _bake_model(model, method_key, out_dir, num_labels)
 
     # PHR-specific: dump layer stats
     if method_key == "phr":
@@ -77,7 +92,7 @@ def _save_model(model, method_key, metrics, idle_vram):
     print(f"  Saved: {out_dir}")
 
 
-def _bake_model(model, method_key, out_dir):
+def _bake_model(model, method_key, out_dir, num_labels=2):
     """Produce a standard HuggingFace baked/ model from the trained model."""
     import torch.nn as nn
     from phr import PHRLinear
@@ -96,7 +111,7 @@ def _bake_model(model, method_key, out_dir):
             from transformers import BertForSequenceClassification
             merged = model.merge_and_unload()
             clean = BertForSequenceClassification.from_pretrained(
-                "bert-base-uncased", num_labels=2, ignore_mismatched_sizes=True,
+                "bert-base-uncased", num_labels=num_labels, ignore_mismatched_sizes=True,
                 local_files_only=True,
             )
             merged_sd = {}
@@ -178,7 +193,7 @@ def _cleanup():
     torch.cuda.synchronize()
 
 
-def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False):
+def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False, task="sst2", seed=42):
     cfg = TrainingConfig(epochs=epochs)
     if cv2lrt:
         cfg.cv2lrt_enabled = True
@@ -198,25 +213,39 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False):
     # ---- Shared data ----
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased", local_files_only=True)
 
-    def tok(batch):
-        return tokenizer(
-            batch["sentence"], truncation=True, padding="max_length", max_length=128
-        )
+    meta = _TASK_META[task]
+    num_labels = meta["num_labels"]
 
-    dataset = load_dataset("glue", "sst2")
+    if task == "mnli":
+        def tok(batch):
+            return tokenizer(
+                batch["premise"], batch["hypothesis"],
+                truncation=True, padding="max_length", max_length=128
+            )
+    else:
+        def tok(batch):
+            return tokenizer(
+                batch["sentence"], truncation=True, padding="max_length", max_length=128
+            )
+
+    dataset = load_dataset("glue", meta["dataset_name"])
     dataset = dataset.map(tok, batched=True).with_format(
         "torch", columns=["input_ids", "attention_mask", "label"]
     )
 
     train_loader = DataLoader(dataset["train"], batch_size=8, shuffle=True, num_workers=0)
-    val_loader = DataLoader(dataset["validation"], batch_size=32, shuffle=False, num_workers=0)
+    val_loaders = {s: DataLoader(dataset[s], batch_size=32, shuffle=False, num_workers=0) for s in meta["val_splits"]}
+    val_loader = val_loaders[meta["val_splits"][0]]
 
     EPOCHS = epochs
     ACC_STEPS = 4
     train_steps = len(train_loader)
     val_steps = max(train_steps // 10, 50)
 
-    print(f"Train batches: {train_steps}, Effective batch: 32, Epochs: {EPOCHS}\n")
+    if quick:
+        print(f"Task: {task} ({num_labels} labels), {train_steps} train batches, 10 batch quick test\n")
+    else:
+        print(f"Task: {task} ({num_labels} labels), Train batches: {train_steps}, Effective batch: 32, Epochs: {EPOCHS}\n")
 
     # ---- Filter methods ----
     methods_to_run = METHODS
@@ -231,6 +260,7 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False):
         print(f"{'='*60}")
 
         _cleanup()
+        method_idle_vram = gpu_used_mb()
         tracker = MemoryTracker()
         tracker.reset()
 
@@ -241,11 +271,11 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False):
             # Suppress model loading progress bars (stderr)
             with redirect_stderr(io.StringIO()):
                 if method_key == "phr" and cfg.cv2lrt_enabled:
-                    model, prebuilt_opt = build_phr_cv2lrt(offload=offload)
+                    model, prebuilt_opt = build_phr_cv2lrt(offload=offload, num_labels=num_labels, seed=seed)
                 elif method_key == "phr":
-                    model, prebuilt_opt = build_fn(offload=offload)
+                    model, prebuilt_opt = build_fn(offload=offload, num_labels=num_labels, seed=seed)
                 else:
-                    model, prebuilt_opt = build_fn()
+                    model, prebuilt_opt = build_fn(num_labels=num_labels, seed=seed)
             # Skip model.to() when offloading — compress_model handles CUDA move
             if not hasattr(model, '_offload_manager'):
                 model.to(device)
@@ -255,7 +285,7 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False):
             tracker.step()
 
             trainable = count_trainable(model)
-            model_vram = gpu_used_mb() - idle_vram
+            model_vram = gpu_used_mb() - method_idle_vram
             print(f"  Params:      {trainable/1e6:.2f} M")
             print(f"  Model VRAM:  {model_vram:.0f} MB")
 
@@ -296,8 +326,9 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False):
             peak_torch = 0
             peak_nvml = 0
             oom = False
+            mismatched_acc = None
 
-            out_dir = os.path.join(RESULTS_DIR, f"sst2_{method_key}_seed42_{RUN_ID}")
+            out_dir = os.path.join(RESULTS_DIR, f"{task}_{method_key}_seed{seed}_{RUN_ID}")
             os.makedirs(out_dir, exist_ok=True)
             log_path = os.path.join(out_dir, "training_log.jsonl")
 
@@ -365,8 +396,12 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False):
 
                 final_val_acc = evaluate(model, val_loader, device)
                 best_val_acc = max(best_val_acc, final_val_acc)
+                if task == "mnli":
+                    mismatched_acc = evaluate(model, val_loaders["validation_mismatched"], device)
+                    best_val_acc = max(best_val_acc, mismatched_acc)
+                    print(f"  MNLI Mismatched: {mismatched_acc:.2f}%")
 
-            results[method_key] = {
+            result_entry = {
                 "name": method_name,
                 "trainable_m": trainable / 1e6,
                 "train_acc": final_train_acc,
@@ -375,6 +410,9 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False):
                 "total_time_s": total_time,
                 "status": "OK",
             }
+            if mismatched_acc is not None:
+                result_entry["val_acc_mismatched"] = mismatched_acc
+            results[method_key] = result_entry
             print(f"  >> Val: {final_val_acc:.2f}% | Best: {best_val_acc:.2f}% | VRAM: {peak_nvml:.2f} GB")
 
             # Save model + metrics + PHR artifacts
@@ -389,7 +427,12 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False):
                 "offload": offload,
                 "format_version": 1,
                 "training_config": cfg.to_dict(),
+                "task": task,
+                "num_labels": num_labels,
+                "seed": seed,
             }
+            if mismatched_acc is not None:
+                save_metrics["val_acc_mismatched"] = mismatched_acc
             if cv2lrt is not None:
                 save_metrics["cv2lrt"] = {
                     "enabled": True,
@@ -401,7 +444,7 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False):
                     "num_groups": len(optimizer.param_groups),
                     "final_stats": cv2lrt.get_stats(),
                 }
-            _save_model(model, method_key, save_metrics, idle_vram)
+            _save_model(model, method_key, save_metrics, method_idle_vram, num_labels=num_labels, task=task, seed=seed)
 
         except torch.cuda.OutOfMemoryError as e:
             print(f"  >> OOM")
@@ -416,13 +459,14 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False):
             _cleanup()
 
     # ---- Tables ----
+    task_label = task.upper()
     print(f"\n\n{'='*100}")
-    print("  FULL-WEIGHT TRAINING  (same parameters, different storage)")
+    print(f"  FULL-WEIGHT TRAINING  ({task_label} - same parameters, different storage)")
     print(f"{'='*100}")
     _print_table({k: r for k, r in results.items() if k in ("full", "phr")})
 
     print(f"\n{'='*100}")
-    print("  PARAMETER-EFFICIENT TRAINING  (fewer trainable parameters)")
+    print(f"  PARAMETER-EFFICIENT TRAINING  ({task_label} - fewer trainable parameters)")
     print(f"{'='*100}")
     _print_table({k: r for k, r in results.items() if k in ("lora", "qlora", "bitfit")})
 
@@ -447,6 +491,8 @@ def _print_table(entries):
                 f"{r['vram_gb']:>6.2f} GB {r['val_acc']:>7.2f}% "
                 f"{r['total_time_s']:>5.0f}s {eff:>7.1f}"
             )
+            if "val_acc_mismatched" in r:
+                print(f"  {'':22} {'':8} {'':>8} {'':>8} Mismatched: {r['val_acc_mismatched']:>5.2f}%")
         else:
             print(f"{r['name']:<22} {r['status']:<8} {'-':>8} {'-':>8} {'-':>9} {'-':>7} {'-':>8}")
     print()
@@ -459,11 +505,17 @@ if __name__ == "__main__":
     cv2lrt = "--cv2lrt" in sys.argv
     method_filter = None
     epochs = 5
+    task = "sst2"
+    seed = 42
     for arg in sys.argv:
         if arg.startswith("--method="):
             method_filter = arg.split("=")[1]
         elif arg.startswith("--epochs="):
             epochs = int(arg.split("=")[1])
+        elif arg.startswith("--task="):
+            task = arg.split("=")[1]
+        elif arg.startswith("--seed="):
+            seed = int(arg.split("=")[1])
     if run_all:
         method_filter = None
-    run(quick=quick, method_filter=method_filter, epochs=epochs, offload=offload, cv2lrt=cv2lrt)
+    run(quick=quick, method_filter=method_filter, epochs=epochs, offload=offload, cv2lrt=cv2lrt, task=task, seed=seed)
