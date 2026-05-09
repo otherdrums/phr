@@ -22,11 +22,12 @@ import transformers, datasets
 transformers.logging.set_verbosity_error()
 datasets.disable_progress_bar()
 
-from .configs import METHODS, build_optimizer, count_trainable
+from .configs import METHODS, build_optimizer, count_trainable, build_phr_cv2lrt
 from .training import train_one_epoch, evaluate
 from .memory_tracker import MemoryTracker, gpu_used_mb
 from .training_config import TrainingConfig
 from torch.optim.lr_scheduler import LinearLR, SequentialLR, LambdaLR
+from phr.cv2lrt import CV2LRTController
 import math
 
 
@@ -177,8 +178,10 @@ def _cleanup():
     torch.cuda.synchronize()
 
 
-def run(quick=False, method_filter=None, epochs=5, offload=False):
+def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False):
     cfg = TrainingConfig(epochs=epochs)
+    if cv2lrt:
+        cfg.cv2lrt_enabled = True
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     total_vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
@@ -237,7 +240,9 @@ def run(quick=False, method_filter=None, epochs=5, offload=False):
         try:
             # Suppress model loading progress bars (stderr)
             with redirect_stderr(io.StringIO()):
-                if method_key == "phr":
+                if method_key == "phr" and cfg.cv2lrt_enabled:
+                    model, prebuilt_opt = build_phr_cv2lrt(offload=offload)
+                elif method_key == "phr":
                     model, prebuilt_opt = build_fn(offload=offload)
                 else:
                     model, prebuilt_opt = build_fn()
@@ -257,17 +262,32 @@ def run(quick=False, method_filter=None, epochs=5, offload=False):
             steps_per_epoch = len(train_loader)
             total_micro_steps = steps_per_epoch * cfg.epochs
             warmup_steps = int(cfg.warmup_fraction * total_micro_steps)
-            hold_start = int(cfg.hold_fraction * total_micro_steps)
 
-            scheduler = SequentialLR(
-                optimizer,
-                schedulers=[
-                    LinearLR(optimizer, start_factor=cfg.warmup_start_factor, end_factor=1.0, total_iters=warmup_steps),
-                    LinearLR(optimizer, start_factor=1.0, end_factor=1.0, total_iters=hold_start - warmup_steps),
-                    LambdaLR(optimizer, lr_lambda=_cosine_factor(total_micro_steps - hold_start, cfg.decay_eta_min)),
-                ],
-                milestones=[warmup_steps, hold_start],
-            )
+            cv2lrt = None
+            scheduler = None
+
+            if cfg.cv2lrt_enabled and method_key == "phr":
+                cv2lrt = CV2LRTController(
+                    optimizer,
+                    beta=cfg.cv2lrt_beta,
+                    min_multiplier=cfg.cv2lrt_min_multiplier,
+                    max_multiplier=cfg.cv2lrt_max_multiplier,
+                    velocity_scale=cfg.cv2lrt_velocity_scale,
+                )
+                print(f"  CV2LRT:      enabled (β={cfg.cv2lrt_beta}, "
+                      f"granularity={cfg.cv2lrt_granularity}, "
+                      f"{len(optimizer.param_groups)} groups)")
+            else:
+                hold_start = int(cfg.hold_fraction * total_micro_steps)
+                scheduler = SequentialLR(
+                    optimizer,
+                    schedulers=[
+                        LinearLR(optimizer, start_factor=cfg.warmup_start_factor, end_factor=1.0, total_iters=warmup_steps),
+                        LinearLR(optimizer, start_factor=1.0, end_factor=1.0, total_iters=hold_start - warmup_steps),
+                        LambdaLR(optimizer, lr_lambda=_cosine_factor(total_micro_steps - hold_start, cfg.decay_eta_min)),
+                    ],
+                    milestones=[warmup_steps, hold_start],
+                )
 
             total_time = 0
             final_val_acc = 0
@@ -327,7 +347,9 @@ def run(quick=False, method_filter=None, epochs=5, offload=False):
                         model, train_loader, optimizer, epoch, device,
                         acc_steps=ACC_STEPS, val_loader=val_loader,
                         val_steps=val_steps, tracker=tracker,
-                        scheduler=scheduler,
+                        scheduler=scheduler, cv2lrt=cv2lrt,
+                        warmup_steps=warmup_steps,
+                        steps_per_epoch=steps_per_epoch,
                         log_path=log_path,
                     )
                     epoch_time = time.time() - t0
@@ -356,7 +378,7 @@ def run(quick=False, method_filter=None, epochs=5, offload=False):
             print(f"  >> Val: {final_val_acc:.2f}% | Best: {best_val_acc:.2f}% | VRAM: {peak_nvml:.2f} GB")
 
             # Save model + metrics + PHR artifacts
-            _save_model(model, method_key, {
+            save_metrics = {
                 "val_acc": best_val_acc,
                 "final_val_acc": final_val_acc,
                 "train_acc": final_train_acc,
@@ -367,7 +389,19 @@ def run(quick=False, method_filter=None, epochs=5, offload=False):
                 "offload": offload,
                 "format_version": 1,
                 "training_config": cfg.to_dict(),
-            }, idle_vram)
+            }
+            if cv2lrt is not None:
+                save_metrics["cv2lrt"] = {
+                    "enabled": True,
+                    "beta": cfg.cv2lrt_beta,
+                    "min_multiplier": cfg.cv2lrt_min_multiplier,
+                    "max_multiplier": cfg.cv2lrt_max_multiplier,
+                    "velocity_scale": cfg.cv2lrt_velocity_scale,
+                    "granularity": cfg.cv2lrt_granularity,
+                    "num_groups": len(optimizer.param_groups),
+                    "final_stats": cv2lrt.get_stats(),
+                }
+            _save_model(model, method_key, save_metrics, idle_vram)
 
         except torch.cuda.OutOfMemoryError as e:
             print(f"  >> OOM")
@@ -422,6 +456,7 @@ if __name__ == "__main__":
     quick = "--quick" in sys.argv
     run_all = "--all" in sys.argv
     offload = "--offload" in sys.argv
+    cv2lrt = "--cv2lrt" in sys.argv
     method_filter = None
     epochs = 5
     for arg in sys.argv:
@@ -431,4 +466,4 @@ if __name__ == "__main__":
             epochs = int(arg.split("=")[1])
     if run_all:
         method_filter = None
-    run(quick=quick, method_filter=method_filter, epochs=epochs, offload=offload)
+    run(quick=quick, method_filter=method_filter, epochs=epochs, offload=offload, cv2lrt=cv2lrt)

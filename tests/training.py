@@ -28,6 +28,9 @@ def train_one_epoch(
     criterion=None,
     scheduler=None,
     log_path=None,
+    cv2lrt=None,
+    warmup_steps=0,
+    steps_per_epoch=None,
 ):
     if criterion is None:
         criterion = nn.CrossEntropyLoss()
@@ -43,6 +46,8 @@ def train_one_epoch(
 
     optimizer.zero_grad(set_to_none=True)
 
+    global_step = None  # will be computed per-iteration if cv2lrt is active
+
     for batch_idx, batch in enumerate(train_loader):
         ids = batch["input_ids"].to(device)
         mask = batch["attention_mask"].to(device)
@@ -51,8 +56,15 @@ def train_one_epoch(
         outputs = model(input_ids=ids, attention_mask=mask)
         loss = criterion(outputs.logits, labels) / acc_steps
         loss.backward()
+
+        # ---- LR scheduling ----
+        global_step = None
         if scheduler is not None:
             scheduler.step()
+        elif cv2lrt is not None and steps_per_epoch is not None:
+            global_step = (epoch - 1) * steps_per_epoch + batch_idx
+            if global_step < warmup_steps:
+                cv2lrt.warmup_step(global_step, warmup_steps)
 
         total_loss += loss.item() * acc_steps
         correct += (outputs.logits.argmax(-1) == labels).sum().item()
@@ -60,6 +72,11 @@ def train_one_epoch(
 
         if (batch_idx + 1) % acc_steps == 0:
             optimizer.step()
+            # CV2LRT engages after warmup completes
+            if cv2lrt is not None and (
+                global_step is None or global_step >= warmup_steps
+            ):
+                cv2lrt.step()
             optimizer.zero_grad(set_to_none=True)
             tracker.step()
 
@@ -69,12 +86,7 @@ def train_one_epoch(
             running_loss = total_loss / (batch_idx + 1)
             running_acc = 100.0 * correct / total
             vram = gpu_used_mb()
-            print(
-                f"  step {batch_idx+1:05d} | "
-                f"loss {running_loss:.4f} | acc {running_acc:.2f}% | "
-                f"VRAM {vram:.0f}MB | {elapsed:.0f}s"
-            )
-            _append_log(log_path, {
+            entry = {
                 "epoch": epoch,
                 "step": batch_idx + 1,
                 "event": "heartbeat",
@@ -82,22 +94,35 @@ def train_one_epoch(
                 "train_acc": round(running_acc, 2),
                 "vram_mb": vram,
                 "elapsed_s": int(elapsed),
-            })
+            }
+            if cv2lrt is not None:
+                entry["cv2lrt"] = cv2lrt.get_stats()
+            print(
+                f"  step {batch_idx+1:05d} | "
+                f"loss {running_loss:.4f} | acc {running_acc:.2f}% | "
+                f"VRAM {vram:.0f}MB | {elapsed:.0f}s"
+            )
+            _append_log(log_path, entry)
 
         # Validate on schedule
         if (batch_idx + 1) % val_steps == 0 and val_loader is not None:
             acc = evaluate(model, val_loader, device)
             val_accuracies[batch_idx + 1] = acc
-            print(f"  -- val acc {acc:.2f}%")
-            _append_log(log_path, {
+            entry = {
                 "epoch": epoch,
                 "step": batch_idx + 1,
                 "event": "val",
                 "val_acc": round(acc, 2),
-            })
+            }
+            if cv2lrt is not None:
+                entry["cv2lrt"] = cv2lrt.get_stats()
+            print(f"  -- val acc {acc:.2f}%")
+            _append_log(log_path, entry)
 
     if (batch_idx + 1) % acc_steps != 0:
         optimizer.step()
+        if cv2lrt is not None and (global_step is None or global_step >= warmup_steps):
+            cv2lrt.step()
         optimizer.zero_grad(set_to_none=True)
         tracker.step()
 

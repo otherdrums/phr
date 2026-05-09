@@ -17,6 +17,7 @@ from .layer_patcher import compress_model
 from .config import PHRConfig, SchemeType
 from .optim import FusedQuantizedAdam
 from .offload import OffloadManager
+from .cv2lrt import CV2LRTController
 
 __all__ = [
     "phr_matmul",
@@ -27,4 +28,5 @@ __all__ = [
     "SchemeType",
     "FusedQuantizedAdam",
     "OffloadManager",
+    "CV2LRTController",
 ]

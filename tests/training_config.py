@@ -45,6 +45,14 @@ class TrainingConfig:
     warmup_start_factor: float = 0.1
     decay_eta_min: float = 0.1
 
+    # ── CV2LRT adaptive scheduler ──
+    cv2lrt_enabled: bool = False
+    cv2lrt_beta: float = 0.97
+    cv2lrt_min_multiplier: float = 0.1
+    cv2lrt_max_multiplier: float = 1.0
+    cv2lrt_velocity_scale: float = 10.0
+    cv2lrt_granularity: str = "matrix"   # "coarse" | "layer" | "matrix"
+
     # ── Training loop ──
     epochs: int = 5
     batch_size: int = 8

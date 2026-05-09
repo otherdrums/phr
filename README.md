@@ -14,6 +14,7 @@ codebook-indexed weights with learnable residuals.
 - **3 bytes/weight** persistent storage (uint8 indices + bf16 residual + 256-entry LUT)
 - **8-bit AdamW optimizer** (`FusedQuantizedAdam`) via Triton — int8 m/v moments save 6 bytes per trainable param, with full β₁=0.9 momentum matching standard AdamW
 - **3-phase LR schedule** — linear warmup → constant hold → cosine decay, with differential LR for body (2e-5) vs classification head (1e-3)
+- **CV2LRT adaptive scheduler** — Continuous Velocity to Learning Rate Translation: reads AdamW second-moment velocity (exp_avg_sq) in real time and adapts per-layer learning rates without hand-tuned schedules
 - **Learnable 256-entry codebook** with multiplicative nibble encoding
 - **Fused CUDA decode kernel** — no persistent full-precision weight matrix materialized
 - **Drop-in replacement** for `nn.Linear` in any HuggingFace model
@@ -180,6 +181,7 @@ phr/
 ├── phr/
 │   ├── __init__.py          # Package exports
 │   ├── config.py            # PHRConfig dataclass
+│   ├── cv2lrt.py            # CV2LRT — adaptive per-layer LR from gradient velocity
 │   ├── offload.py           # OffloadManager (CPU↔GPU tensor streaming)
 │   ├── layer.py             # PHRLinear nn.Module
 │   ├── autograd.py          # PHRMatmulFunction (custom autograd)
@@ -354,6 +356,7 @@ python -m tests.harness --all              # Same — explicit full comparison
 python -m tests.harness --quick            # 10-batch quick check
 python -m tests.harness --method=phr       # PHR only
 python -m tests.harness --method=phr --offload  # PHR with CPU offloading
+python -m tests.harness --method=phr --cv2lrt   # PHR with adaptive CV2LRT scheduler
 python -m tests.harness --epochs=3         # Custom epoch count
 ```
 
@@ -366,6 +369,26 @@ python -m tests.analyzer                   # Tables + charts in results/_analysi
 ## Roadmap
 
 Features implemented:
+
+- **CV2LRT adaptive scheduler** — ✅ Continuous Velocity to Learning Rate
+  Translation.  Reads AdamW second-moment velocity (`exp_avg_sq`) every optimizer
+  step, applies an EMA low-pass filter (β=0.97) to separate signal from
+  micro-batch noise, and translates the filtered velocity to per-layer LR
+  multipliers in real time.  Fully automatic — no hand-tuned schedules needed.
+  Configurable granularity (`"matrix"`, `"layer"`, `"coarse"`).
+  ```python
+  from phr import CV2LRTController
+  cv2lrt = CV2LRTController(optimizer, beta=0.97, min_multiplier=0.1)
+  # In training loop:
+  if step < warmup_steps:
+      cv2lrt.warmup_step(step, warmup_steps)
+  elif acc_step:
+      optimizer.step()
+      cv2lrt.step()
+  ```
+  ```bash
+  python -m tests.harness --method=phr --cv2lrt
+  ```
 
 - **CPU offloading** — ✅ Set `offload=True` in `PHRConfig`.  Frozen W_p
   indices are streamed from pinned CPU RAM via a GPU buffer pool.  Optimizer

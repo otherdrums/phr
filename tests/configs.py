@@ -170,6 +170,94 @@ def build_optimizer(model, method_name, prebuilt_optimizer=None):
     )
 
 
+def _param_group_key(name, granularity="matrix"):
+    """Return a group key for a named parameter based on granularity.
+
+    granularity values:
+      - "coarse":  single "body" key for all non-head params
+      - "layer":   "layer_{N}" for encoder layer N, "embeddings", "pooler", "head"
+      - "matrix":  the module path (parameter name with last segment stripped)
+    """
+    if "classifier" in name or "cls" in name:
+        return "head"
+
+    if granularity == "coarse":
+        return "body"
+
+    # Extract encoder layer index for "layer" granularity
+    if granularity == "layer":
+        import re
+        m = re.search(r"encoder\.layer\.(\d+)", name)
+        if m:
+            return f"layer_{m.group(1)}"
+        if "embedding" in name.lower():
+            return "embeddings"
+        if "pooler" in name.lower():
+            return "pooler"
+        return "body"
+
+    # "matrix" granularity: strip last .-segment (W_f, weight, bias, etc.)
+    granularity = "matrix"  # default
+    return ".".join(name.split(".")[:-1])
+
+
+def build_phr_cv2lrt(offload=False):
+    """PHR-compressed FFN layers with per-module parameter groups for CV2LRT."""
+    torch.manual_seed(SHARED_SEED)
+    model = BertForSequenceClassification.from_pretrained(
+        "bert-base-uncased", num_labels=2, ignore_mismatched_sizes=True,
+        **_MODEL_KWARGS,
+    )
+    phr_cfg = PHRConfig(
+        scheme=_cfg.scheme,
+        layer_scope=_cfg.layer_scope,
+        learnable_lut=_cfg.learnable_lut,
+        gradient_checkpointing=_cfg.gradient_checkpointing,
+        offload=offload,
+    )
+    model = compress_model(model, phr_cfg)
+
+    granularity = _cfg.cv2lrt_granularity
+
+    # Collect params by group key
+    head_params = []
+    groups: dict = {}  # key → [params]
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        key = _param_group_key(n, granularity)
+        if key == "head":
+            head_params.append(p)
+        else:
+            groups.setdefault(key, []).append(p)
+
+    # Build param_groups list with per-group LR
+    param_groups = []
+    for key, params in sorted(groups.items()):
+        param_groups.append({
+            "params": params,
+            "lr": _cfg.body_lr,
+            "name": key,
+        })
+    if head_params:
+        param_groups.append({
+            "params": head_params,
+            "lr": _cfg.head_lr,
+            "name": "head",
+        })
+
+    optimizer = FusedQuantizedAdam(
+        param_groups,
+        betas=_cfg.betas,
+        eps=_cfg.eps,
+        weight_decay=_cfg.weight_decay,
+        block_size=_cfg.block_size,
+    )
+    if offload and hasattr(model, '_offload_manager'):
+        optimizer.enable_offload(model._offload_manager)
+    return model, optimizer
+
+
 def count_trainable(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
