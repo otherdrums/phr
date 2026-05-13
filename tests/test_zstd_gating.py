@@ -14,9 +14,14 @@ Metrics collected per epoch and saved to results/zstd_gating_<run_id>/:
   - Full block-level detail for post-hoc threshold tuning
 """
 
+import sys
+import os
+
+# Ensure repo root is on sys.path so streamcc imports work
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import torch
 import torch.nn as nn
-import os
 import json
 import time
 from datetime import datetime
@@ -88,9 +93,10 @@ def post_step_all(model):
         layer.post_step()
 
 
-def decay_all(model):
+def shrink_all(model):
+    """Decay known blocks toward zero on all ZPackRLinear layers."""
     for layer in _zpackr_layers(model):
-        layer.decay_delta()
+        layer.shrink_known_delta()
 
 
 # ── Metrics collection ──
@@ -240,7 +246,7 @@ t0 = time.time()
 
 for epoch in range(1, EPOCHS + 1):
     print(f"\n  --- Epoch {epoch}/{EPOCHS} ---")
-    decay_all(model)
+    shrink_all(model)
     cog.cogitate("sst2", max_epochs=1, use_zstd_gating=True)
     post_step_all(model)
 
@@ -268,7 +274,7 @@ print(f"  {n} prompts ingested")
 
 for epoch in range(1, EPOCHS + 1):
     print(f"\n  --- Epoch {epoch}/{EPOCHS} ---")
-    decay_all(model)
+    shrink_all(model)
     cog.cogitate("mnli", max_epochs=1, use_zstd_gating=True)
     post_step_all(model)
 
