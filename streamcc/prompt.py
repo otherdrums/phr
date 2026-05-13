@@ -35,7 +35,7 @@ def encode_classification(
         encoded = tokenizer(
             text_a, text_b,
             truncation=True,
-            padding=False,
+            padding="max_length",
             max_length=max_length,
             return_tensors="pt",
         )
@@ -44,7 +44,7 @@ def encode_classification(
         encoded = tokenizer(
             text_a,
             truncation=True,
-            padding=False,
+            padding="max_length",
             max_length=max_length,
             return_tensors="pt",
         )
