@@ -234,6 +234,11 @@ cog.cogitate("sst2", max_epochs=EPOCHS_PER_TASK)
 val_sst2_1 = validate(stream.model, "sst2")
 print(f"\n  SST-2 final: {val_sst2_1:.2f}%  ({time.time() - t0:.0f}s)")
 
+# ── Cross-domain transfer check (pre-MNLI) ──
+val_mnli_pre = validate(stream.model, "mnli")
+transfer_gain = val_mnli_pre - 33.33  # baseline = random (3-class)
+print(f"  MNLI (pre-train, SST-2 only): {val_mnli_pre:.2f}%  (+{transfer_gain:+.1f}% from SST-2)")
+
 
 # ═══════════════════════════════════════════════════════════════
 # Phase 2: MNLI
@@ -263,6 +268,7 @@ val_sst2_2 = validate(stream.model, "sst2")
 delta = val_sst2_2 - val_sst2_1
 
 print(f"\n  SST-2 Phase 1: {val_sst2_1:.2f}%")
+print(f"  MNLI pre-train: {val_mnli_pre:.2f}%  (+{transfer_gain:+.1f}% from SST-2)")
 print(f"  SST-2 Phase 3: {val_sst2_2:.2f}%")
 print(f"  Delta:         {delta:+.2f}%")
 print(f"  MNLI:          {val_mnli:.2f}%")
@@ -282,6 +288,8 @@ summary = {
         "sst2_phase1": round(val_sst2_1, 2),
         "sst2_phase3": round(val_sst2_2, 2),
         "sst2_delta": round(delta, 2),
+        "mnli_pre_train": round(val_mnli_pre, 2),
+        "mnli_transfer_gain": round(transfer_gain, 1),
         "mnli": round(val_mnli, 2),
     },
 }
