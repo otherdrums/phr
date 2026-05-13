@@ -192,7 +192,7 @@ log_path = os.path.join(OUT_DIR, "training_log.jsonl")
 sup = model.super_zstd
 
 stream = StreamTrainer(model, opt, cv2lrt=None, acc_steps=4)
-cog = Cogitator(stream, super_zstd=sup, zstd_gate_threshold=GATE_THRESHOLD)
+cog = Cogitator(stream, super_zstd=sup, zstd_gate_threshold=GATE_THRESHOLD, batch_size=16)
 cog._current_task = "sst2"  # for early logging
 
 # Attach the step-level hook
@@ -229,7 +229,7 @@ print(f"  {n} prompts ingested")
 cog._current_task = "sst2"
 t0 = time.time()
 
-cog.cogitate("sst2", max_epochs=EPOCHS_PER_TASK, use_zstd_gating=GATE_ENABLED)
+cog.cogitate("sst2", max_epochs=EPOCHS_PER_TASK)
 
 val_sst2_1 = validate(stream.model, "sst2")
 print(f"\n  SST-2 final: {val_sst2_1:.2f}%  ({time.time() - t0:.0f}s)")
@@ -246,7 +246,7 @@ print(f"  {n} prompts ingested")
 
 cog._current_task = "mnli"
 
-cog.cogitate("mnli", max_epochs=EPOCHS_PER_TASK, use_zstd_gating=GATE_ENABLED)
+cog.cogitate("mnli", max_epochs=EPOCHS_PER_TASK)
 
 val_mnli = validate(stream.model, "mnli")
 print(f"\n  MNLI final: {val_mnli:.2f}%  ({time.time() - t0:.0f}s)")

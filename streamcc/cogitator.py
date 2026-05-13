@@ -67,11 +67,14 @@ class Cogitator:
         super_zstd=None,
         zstd_gate_threshold: float = 2.0,
         post_opt_step_fn=None,
+        batch_size: int = 16,
     ):
         self.trainer = stream_trainer
         self.super_zstd = super_zstd
         self.zstd_gate_threshold = zstd_gate_threshold
+        self.batch_size = batch_size
         self._post_opt_step_fn = post_opt_step_fn
+        self._zstd_gating_active = (super_zstd is not None)
 
         # Wire post-opt-step hook into trainer
         if post_opt_step_fn is not None and stream_trainer._post_opt_step_fn is None:
@@ -104,12 +107,16 @@ class Cogitator:
         val_fn=None,
         val_interval: int = 0,
         verbose: bool = True,
-        use_zstd_gating: bool = False,
     ):
-        """Run one pass over a task's prompts.
+        """Run one pass over a task's prompts, batched for GPU throughput.
 
-        In ZPackR mode, call post_step() and decay_delta() separately
-        between cogitate() calls — the Cogitator only handles prompt iteration.
+        Args:
+            task:         task name in the prompt library
+            max_epochs:   maximum training passes
+            warmup_steps: (ignored in zpackr mode — no LR schedule)
+            val_fn:       callable(stream_trainer) → float (validation callback)
+            val_interval: validate every N steps (0 = never)
+            verbose:      print progress
         """
         if task not in self._prompts:
             raise KeyError(f"Unknown task: {task} (ingest first)")
@@ -122,6 +129,7 @@ class Cogitator:
         state = self._task_state[task]
         prompts = self._prompts[task]
         total_prompts = len(prompts)
+        bs = self.batch_size
 
         for epoch in range(max_epochs):
             if task in self._converged_tasks:
@@ -129,35 +137,54 @@ class Cogitator:
 
             self.trainer.reset_stats()
 
-            for i, prompt_tuple in enumerate(prompts):
+            # Batch prompts for GPU throughput
+            for batch_start in range(0, total_prompts, bs):
+                batch_end = min(batch_start + bs, total_prompts)
+                batch_prompts = prompts[batch_start:batch_end]
+
                 if task in self._converged_tasks:
                     break
 
-                ids, mask, label = prompt_tuple[0], prompt_tuple[1], prompt_tuple[2]
-                text = prompt_tuple[3] if len(prompt_tuple) > 3 else None
+                # Collect prompt tuples, optionally filter with zstd gate
+                ids_list, mask_list, label_list = [], [], []
+                for prompt_tuple in batch_prompts:
+                    ids, mask, label = prompt_tuple[0], prompt_tuple[1], prompt_tuple[2]
+                    text = prompt_tuple[3] if len(prompt_tuple) > 3 else None
 
-                # Level 0: zstd gating (before forward pass)
-                if use_zstd_gating and self.super_zstd is not None and text is not None:
-                    if not self._zstd_should_train(text):
-                        state.zstd_gated_count += 1
-                        continue
-                    state.zstd_trained_count += 1
+                    if self._zstd_gating_active and self.super_zstd is not None and text is not None:
+                        if not self._zstd_should_train(text):
+                            state.zstd_gated_count += 1
+                            continue
+                        state.zstd_trained_count += 1
 
-                # Fixed LR training (no Velvet warmup in zpackr mode)
-                loss, _ = self.trainer.step(ids, mask, label)
-                state.steps_taken += 1
+                    ids_list.append(ids)
+                    mask_list.append(mask)
+                    label_list.append(label)
+
+                if not ids_list:
+                    continue
+
+                # Stack into batch tensors
+                batch_ids = torch.stack(ids_list)
+                batch_mask = torch.stack(mask_list)
+                batch_labels = torch.tensor(label_list)
+
+                # Training step — batch of prompts
+                loss, _ = self.trainer.step(batch_ids, batch_mask, batch_labels)
+                state.steps_taken += len(ids_list)
                 state.last_loss = loss
 
-                if verbose and (i + 1) % 5000 == 0:
+                i = batch_end
+                if verbose and (i) % 5000 == 0:
                     acc = self.trainer.running_acc
                     parts = [f"[{task}] epoch {epoch + 1}/{max_epochs}",
-                             f"step {i + 1}/{total_prompts}",
+                             f"step {i}/{total_prompts}",
                              f"loss {loss:.4f}  acc {acc:.2f}%"]
-                    if use_zstd_gating:
+                    if self._zstd_gating_active:
                         parts.append(f"zstd(gated={state.zstd_gated_count} trained={state.zstd_trained_count})")
                     print("  " + "  ".join(parts))
 
-                if val_fn is not None and val_interval > 0 and (i + 1) % val_interval == 0:
+                if val_fn is not None and val_interval > 0 and (i) % val_interval == 0:
                     val_acc = val_fn(self.trainer)
                     if verbose:
                         print(f"  [{task}] val acc {val_acc:.2f}%")
@@ -171,14 +198,14 @@ class Cogitator:
 
     def cogitate_all(self, tasks: List[str] = None, max_epochs: int = 1,
                      warmup_steps: int = 0, val_fn=None, val_interval: int = 0,
-                     verbose: bool = True, use_zstd_gating: bool = False):
+                     verbose: bool = True):
         if tasks is None:
             tasks = list(self._prompts.keys())
         for task in tasks:
             if task not in self._converged_tasks:
                 self.cogitate(task, max_epochs=max_epochs, warmup_steps=warmup_steps,
                               val_fn=val_fn, val_interval=val_interval,
-                              verbose=verbose, use_zstd_gating=use_zstd_gating)
+                              verbose=verbose)
 
     # ── Gating ──
 
