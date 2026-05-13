@@ -28,10 +28,11 @@ from torch.utils.data import DataLoader
 from transformers import BertTokenizerFast, BertForSequenceClassification
 from datasets import load_dataset
 
-from packr import compress_model
-from packr.config import PackRConfig
 from packr.optim import FusedQuantizedAdam
-from packr.zpackr_layer import ZPackRLinear
+
+from zpackr import compress_model, ZPackRLinear
+from zpackr.config import ZPackRConfig
+from zpackr.super_dict import load_super_dict
 
 from streamcc.stream import StreamTrainer
 from streamcc.cogitator import Cogitator
@@ -169,8 +170,7 @@ model = BertForSequenceClassification.from_pretrained(
 )
 model.gradient_checkpointing_enable()
 
-config = PackRConfig(
-    mode="zpackr",
+config = ZPackRConfig(
     layer_scope="ffn",
     gradient_checkpointing=True,
     zstd_salience_threshold=1.4,
@@ -282,7 +282,7 @@ summary = {
         "gate_enabled": GATE_ENABLED,
         "gate_threshold": GATE_THRESHOLD,
         "epochs_per_task": EPOCHS_PER_TASK,
-        "mode": "zpackr",
+        "salience_threshold": config.zstd_salience_threshold,
     },
     "results": {
         "sst2_phase1": round(val_sst2_1, 2),

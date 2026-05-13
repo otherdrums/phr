@@ -210,7 +210,7 @@ class Cogitator:
     # ── Gating ──
 
     def _zstd_should_train(self, text: str) -> bool:
-        from packr.prompt_gate import should_train
+        from zpackr.prompt_gate import should_train
         return should_train(text.encode("utf-8"), self.super_zstd, self.zstd_gate_threshold)
 
     # ── Persistence ──
