@@ -1,11 +1,16 @@
-"""StreamCC zstd-gated continuous learning test.
+"""StreamCC zstd-native continuous learning test.
 
-Phase 1: Cogitate on SST-2 → zstd gate filters, CV2LRT converges.
-Phase 2: Cogitate on MNLI → zstd gate protects SST-2 patterns.
-Phase 3: Re-validate SST-2 → accuracy preserved.
+ZPackR (mode="zpackr") replaces nn.Linear with frozen base + WeightDict-compressed
+delta.  Block-level compression ratios against the WeightDict serve as the
+authoritative convergence signal — no Velvet scheduler needed.
+
+Known blocks (high ratio → low novelty): attenuated in forward, decayed over
+time, pruned from VRAM below auto-calibrated threshold.
+Novel blocks (low ratio → high novelty): kept at full strength, full LR.
 """
 
 import torch
+import torch.nn as nn
 import os
 import warnings
 warnings.filterwarnings("ignore")
@@ -15,15 +20,13 @@ from torch.utils.data import DataLoader
 from transformers import BertTokenizerFast, BertForSequenceClassification
 from datasets import load_dataset
 
-from packr import VelvetController
-from packr.super_dict import load_super_dict
+from packr import compress_model
 from packr.config import PackRConfig
-from packr.layer_patcher import compress_model
 from packr.optim import FusedQuantizedAdam
+from packr.super_dict import load_super_dict
 
 from streamcc.stream import StreamTrainer
 from streamcc.cogitator import Cogitator
-from streamcc.prompt import ingest_glue
 
 
 # ── Shared validation ──
@@ -31,7 +34,6 @@ tok = BertTokenizerFast.from_pretrained("bert-base-uncased", local_files_only=Tr
 
 
 def _val_loader(task: str, split: str):
-    ds_path = f"glue/{task}"
     if task == "sst2":
         def tokenize(batch):
             return tok(batch["sentence"], truncation=True, padding="max_length", max_length=128)
@@ -63,7 +65,46 @@ def validate(model, task: str) -> float:
     return 100.0 * correct / total if total > 0 else 0.0
 
 
-# ── Build model in zpackr mode ──
+# ── ZPackR layer helpers ──
+
+def _zpackr_layers(model):
+    """Return all ZPackRLinear layers in the model."""
+    from packr.zpackr_layer import ZPackRLinear
+    return [m for m in model.modules() if isinstance(m, ZPackRLinear)]
+
+
+def post_step_all(model):
+    """Run post_step() on all ZPackRLinear layers after an optimizer step."""
+    for layer in _zpackr_layers(model):
+        layer.post_step()
+
+
+def decay_all(model):
+    """Decay known blocks toward zero on all ZPackRLinear layers."""
+    for layer in _zpackr_layers(model):
+        layer.decay_delta()
+
+
+def novelty_summary(model):
+    """Return per-layer novelty stats for logging."""
+    stats = {}
+    for i, layer in enumerate(_zpackr_layers(model)):
+        info = layer.get_block_ratios()
+        if info:
+            scores = info.get("novelty_scores", [])
+            kept = info.get("salient_count", 0)
+            total = info.get("num_blocks", 0)
+            avg_novelty = sum(scores) / len(scores) if scores else 1.0
+            stats[f"layer_{i}"] = {
+                "salient": f"{kept}/{total}",
+                "avg_novelty": round(avg_novelty, 3),
+            }
+    return stats
+
+
+# ═══════════════════════════════════════════════════════════════
+# Build model in zpackr mode (frozen base + WeightDict delta)
+# ═══════════════════════════════════════════════════════════════
 torch.manual_seed(42)
 
 num_labels = 3  # max across both tasks (MNLI has 3)
@@ -74,15 +115,15 @@ model = BertForSequenceClassification.from_pretrained(
 model.gradient_checkpointing_enable()
 
 config = PackRConfig(
-    scheme="phr",
+    mode="zpackr",
     layer_scope="ffn",
-    learnable_lut=True,
     gradient_checkpointing=True,
+    zstd_salience_threshold=1.4,
 )
 model = compress_model(model, config)
 model.cuda()
 
-# Separate params for differential LR
+# Fixed LR — no scheduler.  WeightDict handles everything.
 head_params = [p for n, p in model.named_parameters()
                if p.requires_grad and ("classifier" in n or "cls" in n)]
 body_params = [p for n, p in model.named_parameters()
@@ -93,22 +134,11 @@ opt = FusedQuantizedAdam([
     {"params": head_params, "lr": 1e-3},
 ], betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, block_size=256)
 
-velvet = VelvetController(opt, beta=0.97, min_multiplier=0.175,
-                          max_multiplier=1.0, velocity_scale=10.0)
+stream = StreamTrainer(model, opt, cv2lrt=None, acc_steps=4)
 
-stream = StreamTrainer(model, opt, velvet, acc_steps=4)
-
-# Load SuperDict for zstd gating
-sup = load_super_dict()
+# SuperDict for optional prompt-level pre-filter
+sup = model.super_zstd
 cog = Cogitator(stream, super_zstd=sup, zstd_gate_threshold=1.5)
-
-
-def _val_fn(task_name):
-    def _fn(trainer):
-        acc = validate(trainer.model, task_name)
-        print(f"  -- {task_name} val acc {acc:.2f}%")
-        return acc
-    return _fn
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -120,20 +150,32 @@ print("=" * 60)
 n = cog.ingest_glue("sst2", limit=None, seed=42)
 print(f"  {n} training prompts ingested")
 
+EPOCHS = 3
+
 print("\n" + "=" * 60)
-print("  Phase 1 — Cogitate SST-2 (3 epochs, zstd gating)")
+print("  Phase 1 — Cogitate SST-2 (zstd-native, no Velvet)")
 print("=" * 60)
 
-total_micro = len(cog._prompts["sst2"]) * 3
-warmup = int(0.02 * total_micro)
+for epoch in range(1, EPOCHS + 1):
+    print(f"\n  --- Epoch {epoch}/{EPOCHS} ---")
 
-cog.cogitate("sst2", max_epochs=3, warmup_steps=warmup,
-             val_fn=_val_fn("sst2"), use_zstd_gating=True)
+    # Decay known blocks before forward passes
+    decay_all(model)
+
+    cog.cogitate("sst2", max_epochs=1, use_zstd_gating=True)
+
+    # Block-level: compress delta vs WeightDict → update novelty
+    post_step_all(model)
+
+    acc = validate(model, "sst2")
+    nv = novelty_summary(model)
+    avg_nv = sum(v["avg_novelty"] for v in nv.values()) / len(nv) if nv else 0
+    print(f"  SST-2 val acc: {acc:.2f}%  avg novelty: {avg_nv:.3f}")
+    for name, s in list(nv.items())[:5]:
+        print(f"    {name}: salient={s['salient']}  novelty={s['avg_novelty']}")
 
 val_sst2_1 = validate(stream.model, "sst2")
-print(f"\n  SST-2 final validation: {val_sst2_1:.2f}%")
-print(f"  Converged: {'sst2' in cog.converged_tasks}")
-print(cog.task_summary())
+print(f"\n  SST-2 final: {val_sst2_1:.2f}%")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -146,22 +188,27 @@ n = cog.ingest_glue("mnli", limit=None, seed=42)
 print(f"  {n} training prompts ingested")
 
 print("\n" + "=" * 60)
-print("  Phase 2 — Cogitate MNLI (3 epochs, zstd gating)")
+print("  Phase 2 — Cogitate MNLI (zstd-native, no Velvet)")
 print("=" * 60)
 
-total_micro = len(cog._prompts["mnli"]) * 3
-warmup = int(0.02 * total_micro)
+for epoch in range(1, EPOCHS + 1):
+    print(f"\n  --- Epoch {epoch}/{EPOCHS} ---")
+    decay_all(model)
+    cog.cogitate("mnli", max_epochs=1, use_zstd_gating=True)
+    post_step_all(model)
 
-cog.cogitate("mnli", max_epochs=3, warmup_steps=warmup,
-             val_fn=_val_fn("mnli"), use_zstd_gating=True)
+    acc = validate(model, "mnli")
+    nv = novelty_summary(model)
+    avg_nv = sum(v["avg_novelty"] for v in nv.values()) / len(nv) if nv else 0
+    print(f"  MNLI val acc: {acc:.2f}%  avg novelty: {avg_nv:.3f}")
 
 val_mnli = validate(stream.model, "mnli")
-print(f"\n  MNLI final validation: {val_mnli:.2f}%")
-print(f"  Converged: {'mnli' in cog.converged_tasks}")
+print(f"\n  MNLI final: {val_mnli:.2f}%")
 
 
 # ═══════════════════════════════════════════════════════════════
-# Phase 3: Verify SST-2 survival
+# Phase 3: Re-validate SST-2 (no retraining, known blocks should
+#          still be attenuated/decayed — test survival)
 # ═══════════════════════════════════════════════════════════════
 print("\n" + "=" * 60)
 print("  Phase 3 — Re-validate SST-2 (no retraining)")
@@ -175,17 +222,12 @@ print(f"  SST-2 after Phase 3:  {val_sst2_2:.2f}%")
 print(f"  Delta:                {delta:+.2f}%")
 print(f"  MNLI:                 {val_mnli:.2f}%")
 
-print(cog.task_summary())
+nv = novelty_summary(model)
+print(f"\n  Final novelty:")
+for name, s in list(nv.items())[:5]:
+    print(f"    {name}: salient={s['salient']}  novelty={s['avg_novelty']}")
 
 if abs(delta) < 1.0 and val_mnli > 50.0:
     print(f"\n  PASS — SST-2 preserved ({abs(delta):.2f}% < 1%), MNLI learned ({val_mnli:.1f}%)")
 else:
     print(f"\n  Needs investigation — delta={delta:+.2f}%, MNLI={val_mnli:.1f}%")
-
-# Final CV2LRT state
-stats = velvet.get_stats()
-print(f"\n  Velvet final state:")
-for name, g in stats.get("per_group", {}).items():
-    if isinstance(g, dict):
-        short = name.replace("bert.encoder.layer.", "L")
-        print(f"    {short[:35]:35s} multiplier={g.get('multiplier', 0):.4f}  lr={g.get('current_lr', 0):.2e}")

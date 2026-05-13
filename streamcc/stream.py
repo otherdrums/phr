@@ -1,10 +1,13 @@
 """StreamTrainer — unified forward+train for continuous token streams.
 
 Replicates the harness training micro-step exactly:
-    forward → loss / acc_steps → backward → optimizer.step → velvet.step
+    forward → loss / acc_steps → backward → optimizer.step
 
 Supports single-example prompts and batched inputs.  Inference passes
 skip backward and optimizer, producing logits only.
+
+In ZPackR mode (cv2lrt=None), block-level WeightDict compression provides
+the convergence signal — no external LR scheduler is needed.
 """
 
 import torch
@@ -15,14 +18,17 @@ class StreamTrainer:
     """Unified train/inference processor mirroring the harness micro-step.
 
     Zero structural overhead vs the harness — same model, same optimizer,
-    same Velvet controller, same gradient path through PackRMatmulFunction.
+    optional Velvet controller for PackR mode, same gradient path.
+
+    In ZPackR mode, leave cv2lrt=None.  The WeightDict's block-level
+    compression ratios handle convergence natively via ZPackRLinear.post_step().
     """
 
     def __init__(
         self,
-        model,                     # BertForSequenceClassification (PHR-compressed or standard)
+        model,                     # BertForSequenceClassification (PackR or ZPackR compressed)
         optimizer,                 # FusedQuantizedAdam or torch.optim.AdamW
-        cv2lrt=None,               # CV2LRTController (optional, adaptive LR)
+        cv2lrt=None,               # VelvetController (optional, PackR mode only)
         acc_steps=4,               # gradient accumulation steps
         device=None,               # torch device (default: model param device)
     ):
