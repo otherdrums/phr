@@ -26,17 +26,19 @@ class StreamTrainer:
 
     def __init__(
         self,
-        model,                     # BertForSequenceClassification (PackR or ZPackR compressed)
-        optimizer,                 # FusedQuantizedAdam or torch.optim.AdamW
-        cv2lrt=None,               # VelvetController (optional, PackR mode only)
-        acc_steps=4,               # gradient accumulation steps
-        device=None,               # torch device (default: model param device)
+        model,
+        optimizer,
+        cv2lrt=None,
+        acc_steps=4,
+        device=None,
+        post_opt_step_fn=None,     # callable() fired after each optimizer.step()
     ):
         self.model = model
         self.optimizer = optimizer
         self.cv2lrt = cv2lrt
         self.acc_steps = acc_steps
         self.device = device or next(model.parameters()).device
+        self._post_opt_step_fn = post_opt_step_fn
 
         # Internal counters
         self._micro_step = 0       # forward+backward calls since last optimizer.step
@@ -101,6 +103,8 @@ class StreamTrainer:
                 self.cv2lrt.step()
             self.optimizer.zero_grad(set_to_none=True)
             self._global_step += 1
+            if self._post_opt_step_fn is not None:
+                self._post_opt_step_fn(self._global_step)
 
         return unscaled, outputs.logits
 

@@ -66,10 +66,16 @@ class Cogitator:
         stream_trainer,
         super_zstd=None,
         zstd_gate_threshold: float = 2.0,
+        post_opt_step_fn=None,
     ):
         self.trainer = stream_trainer
         self.super_zstd = super_zstd
         self.zstd_gate_threshold = zstd_gate_threshold
+        self._post_opt_step_fn = post_opt_step_fn
+
+        # Wire post-opt-step hook into trainer
+        if post_opt_step_fn is not None and stream_trainer._post_opt_step_fn is None:
+            stream_trainer._post_opt_step_fn = post_opt_step_fn
 
         # Prompt storage: task_name → [(input_ids, attention_mask, label, text), ...]
         self._prompts: Dict[str, List[Tuple]] = {}

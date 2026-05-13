@@ -1,23 +1,18 @@
 """StreamCC zstd-native continuous learning test.
 
 ZPackR (mode="zpackr") replaces nn.Linear with frozen base + WeightDict-compressed
-delta.  Block-level compression ratios against the WeightDict serve as the
-authoritative convergence signal — no Velvet scheduler needed.
+delta.  Block-level compression ratios serve as the convergence signal.
 
-Known blocks (high ratio → low novelty): attenuated in forward, decayed over
-time, pruned from VRAM below auto-calibrated threshold.
-Novel blocks (low ratio → high novelty): kept at full strength, full LR.
-
-Metrics collected per epoch and saved to results/zstd_gating_<run_id>/:
-  - Per-layer: salient blocks, avg novelty, threshold, ratios, delta L2 norms
-  - Per-task: validation accuracy, SuperDict gating counts
-  - Full block-level detail for post-hoc threshold tuning
+Parameters tuned per ZPackR dev machine best results:
+  --post-step-interval 4     run post_step every 4 optimizer steps
+  --reindex-interval 4000    rebuild WeightDict every 4000 steps
+  --calibration-multiplier 0.01
+  --gate --gate-threshold 1.5
+  --no-velvet
 """
 
 import sys
 import os
-
-# Ensure repo root is on sys.path so streamcc imports work
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
@@ -36,14 +31,21 @@ from datasets import load_dataset
 from packr import compress_model
 from packr.config import PackRConfig
 from packr.optim import FusedQuantizedAdam
-from packr.super_dict import load_super_dict
 from packr.zpackr_layer import ZPackRLinear
 
 from streamcc.stream import StreamTrainer
 from streamcc.cogitator import Cogitator
 
 
-# ── Output directory ──
+# ── Tunables (matching ZPackR dev machine best results) ──
+POST_STEP_INTERVAL = 4       # run post_step every N optimizer steps
+REINDEX_INTERVAL = 4000      # rebuild WeightDict every N optimizer steps
+CALIBRATION_MULTIPLIER = 0.01
+GATE_ENABLED = True
+GATE_THRESHOLD = 1.5
+EPOCHS_PER_TASK = 3
+
+# ── Output ──
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "results", f"zstd_gating_{RUN_ID}")
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -51,20 +53,6 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 # ── Shared validation ──
 tok = BertTokenizerFast.from_pretrained("bert-base-uncased", local_files_only=True)
-
-
-def _val_loader(task: str, split: str):
-    if task == "sst2":
-        def tokenize(batch):
-            return tok(batch["sentence"], truncation=True, padding="max_length", max_length=128)
-    else:
-        def tokenize(batch):
-            return tok(batch["premise"], batch["hypothesis"],
-                       truncation=True, padding="max_length", max_length=128)
-    split_key = "validation" if task == "sst2" else "validation_matched"
-    ds = load_dataset("glue", task)[split_key].map(tokenize, batched=True)
-    ds = ds.with_format("torch", columns=["input_ids", "attention_mask", "label"])
-    return DataLoader(ds, batch_size=32, shuffle=False)
 
 
 def validate(model, task: str) -> float:
@@ -88,18 +76,37 @@ def _zpackr_layers(model):
     return [m for m in model.modules() if isinstance(m, ZPackRLinear)]
 
 
-def post_step_all(model):
-    for layer in _zpackr_layers(model):
-        layer.post_step()
+def _make_hooks(model, cog, log_path):
+    """Create the post-optimizer-step hook with correct interval gating."""
+
+    def post_opt_step(global_step: int):
+        # shrink_known_delta every step (lightweight, in-place on GPU)
+        for layer in _zpackr_layers(model):
+            layer.shrink_known_delta()
+
+        # post_step every POST_STEP_INTERVAL optimizer steps
+        if global_step % POST_STEP_INTERVAL == 0:
+            for layer in _zpackr_layers(model):
+                layer.post_step(calibration_multiplier=CALIBRATION_MULTIPLIER)
+
+        # reindex WeightDict every REINDEX_INTERVAL steps
+        if global_step % REINDEX_INTERVAL == 0:
+            for layer in _zpackr_layers(model):
+                layer.reindex()
+
+        # Log metrics periodically
+        if global_step % 1000 == 0:
+            acc = validate(model, cog._current_task if hasattr(cog, '_current_task') else "sst2")
+            metrics = collect_step_metrics(model, cog, global_step, acc)
+            _log(log_path, metrics)
+            agg = metrics["aggregate"]
+            print(f"  step {global_step:06d}  val_acc={acc:.2f}%  "
+                  f"novelty={agg['avg_novelty']:.3f}  salient={agg['salient_blocks']}")
+
+    return post_opt_step
 
 
-def shrink_all(model):
-    """Decay known blocks toward zero on all ZPackRLinear layers."""
-    for layer in _zpackr_layers(model):
-        layer.shrink_known_delta()
-
-
-# ── Metrics collection ──
+# ── Metrics ──
 
 def _log(path, entry):
     entry["timestamp"] = datetime.now().isoformat()
@@ -108,7 +115,6 @@ def _log(path, entry):
 
 
 def collect_layer_metrics(model):
-    """Collect per-layer block metrics for tuning and analysis."""
     metrics = {}
     for i, layer in enumerate(_zpackr_layers(model)):
         info = layer.get_block_ratios()
@@ -119,81 +125,40 @@ def collect_layer_metrics(model):
         kept = info.get("salient_count", 0)
         total = info.get("num_blocks", 0)
         threshold = info.get("calibrated_threshold")
-
-        # Per-block detail (full, for threshold tuning)
-        block_detail = []
-        for blk in range(total):
-            r = ratios[blk] if blk < len(ratios) else 1.0
-            n = scores[blk] if blk < len(scores) else 1.0
-            active = r < (threshold or 1.4)  # whether this block stays salient
-            block_detail.append({
-                "block": blk,
-                "ratio": round(r, 4),
-                "novelty": round(n, 4),
-                "salient": active,
-            })
-
-        name = f"layer_{i}"
-        metrics[name] = {
-            "salient_blocks": kept,
-            "total_blocks": total,
+        metrics[f"layer_{i}"] = {
+            "salient": f"{kept}/{total}",
             "salient_pct": round(100.0 * kept / total, 1) if total else 0,
             "avg_novelty": round(sum(scores) / len(scores), 4) if scores else 1.0,
             "min_novelty": round(min(scores), 4) if scores else 1.0,
             "max_novelty": round(max(scores), 4) if scores else 1.0,
             "avg_ratio": round(sum(ratios) / len(ratios), 4) if ratios else 1.0,
-            "min_ratio": round(min(ratios), 4) if ratios else 1.0,
-            "max_ratio": round(max(ratios), 4) if ratios else 1.0,
             "ratio_gap": round(max(ratios) - min(ratios), 4) if ratios else 0.0,
-            "calibrated_threshold": round(threshold, 4) if threshold else None,
-            "block_detail": block_detail,
+            "threshold": round(threshold, 4) if threshold else None,
         }
     return metrics
 
 
-def collect_epoch_metrics(model, cog, task, epoch, val_acc, elapsed_s):
-    """Collect full epoch metrics for JSON logging."""
-    layer_metrics = collect_layer_metrics(model)
-
-    # Aggregate across layers
-    salient_total = sum(m["salient_blocks"] for m in layer_metrics.values())
-    blocks_total = sum(m["total_blocks"] for m in layer_metrics.values())
-    novelty_vals = [m["avg_novelty"] for m in layer_metrics.values()]
-    ratio_gaps = [m["ratio_gap"] for m in layer_metrics.values()]
-
-    state = cog._task_state.get(task)
-    zstd_gated = state.zstd_gated_count if state else 0
-    zstd_trained = state.zstd_trained_count if state else 0
-    steps = state.steps_taken if state else 0
-
-    # WeightDict info
+def collect_step_metrics(model, cog, step, val_acc):
+    layer_m = collect_layer_metrics(model)
+    salient_t = sum(int(m["salient"].split("/")[0]) for m in layer_m.values())
+    blocks_t = sum(int(m["salient"].split("/")[1]) for m in layer_m.values())
+    novelty_vals = [m["avg_novelty"] for m in layer_m.values()]
     wd = getattr(model, "weight_dict", None)
-    wd_entries = wd.num_entries if wd else 0
-
     return {
-        "phase": task,
-        "epoch": epoch,
+        "step": step,
         "val_acc": round(val_acc, 2),
-        "elapsed_s": int(elapsed_s),
-        "weight_dict_entries": wd_entries,
+        "weight_dict_entries": wd.num_entries if wd else 0,
         "aggregate": {
-            "salient_blocks": f"{salient_total}/{blocks_total}",
-            "salient_pct": round(100.0 * salient_total / blocks_total, 1) if blocks_total else 0,
+            "salient_blocks": f"{salient_t}/{blocks_t}",
+            "salient_pct": round(100.0 * salient_t / blocks_t, 1) if blocks_t else 0,
             "avg_novelty": round(sum(novelty_vals) / len(novelty_vals), 4) if novelty_vals else 1.0,
-            "avg_ratio_gap": round(sum(ratio_gaps) / len(ratio_gaps), 4) if ratio_gaps else 0.0,
         },
-        "zstd_gating": {
-            "gated": zstd_gated,
-            "trained": zstd_trained,
-            "gated_pct": round(100.0 * zstd_gated / max(zstd_gated + zstd_trained, 1), 1),
-        },
-        "steps_taken": steps,
-        "per_layer": layer_metrics,
+        "per_layer": layer_m,
     }
 
 
 # ═══════════════════════════════════════════════════════════════
-# Build model in zpackr mode
+# Build model
 # ═══════════════════════════════════════════════════════════════
 torch.manual_seed(42)
 
@@ -223,14 +188,34 @@ opt = FusedQuantizedAdam([
     {"params": head_params, "lr": 1e-3},
 ], betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, block_size=256)
 
-stream = StreamTrainer(model, opt, cv2lrt=None, acc_steps=4)
-sup = model.super_zstd
-cog = Cogitator(stream, super_zstd=sup, zstd_gate_threshold=1.5)
-
 log_path = os.path.join(OUT_DIR, "training_log.jsonl")
+sup = model.super_zstd
+
+stream = StreamTrainer(model, opt, cv2lrt=None, acc_steps=4)
+cog = Cogitator(stream, super_zstd=sup, zstd_gate_threshold=GATE_THRESHOLD)
+cog._current_task = "sst2"  # for early logging
+
+# Attach the step-level hook
+stream._post_opt_step_fn = _make_hooks(model, cog, log_path)
+
+
+def _val_loader(task: str, split: str):
+    if task == "sst2":
+        def tokenize(batch):
+            return tok(batch["sentence"], truncation=True, padding="max_length", max_length=128)
+    else:
+        def tokenize(batch):
+            return tok(batch["premise"], batch["hypothesis"],
+                       truncation=True, padding="max_length", max_length=128)
+    split_key = "validation" if task == "sst2" else "validation_matched"
+    ds = load_dataset("glue", task)[split_key].map(tokenize, batched=True)
+    ds = ds.with_format("torch", columns=["input_ids", "attention_mask", "label"])
+    return DataLoader(ds, batch_size=32, shuffle=False)
+
 
 print(f"\n  Output: {OUT_DIR}")
-print(f"  Config: mode={config.mode}, threshold={config.zstd_salience_threshold}")
+print(f"  Config: post_step_interval={POST_STEP_INTERVAL} reindex={REINDEX_INTERVAL} "
+      f"calibration={CALIBRATION_MULTIPLIER} gate={GATE_ENABLED}({GATE_THRESHOLD})")
 
 # ═══════════════════════════════════════════════════════════════
 # Phase 1: SST-2
@@ -241,26 +226,13 @@ print("=" * 60)
 n = cog.ingest_glue("sst2", limit=None, seed=42)
 print(f"  {n} prompts ingested")
 
-EPOCHS = 3
+cog._current_task = "sst2"
 t0 = time.time()
 
-for epoch in range(1, EPOCHS + 1):
-    print(f"\n  --- Epoch {epoch}/{EPOCHS} ---")
-    shrink_all(model)
-    cog.cogitate("sst2", max_epochs=1, use_zstd_gating=True)
-    post_step_all(model)
-
-    acc = validate(model, "sst2")
-    elapsed = time.time() - t0
-    metrics = collect_epoch_metrics(model, cog, "sst2", epoch, acc, elapsed)
-    _log(log_path, metrics)
-
-    agg = metrics["aggregate"]
-    print(f"  val acc: {acc:.2f}%  novelty: {agg['avg_novelty']:.3f}  "
-          f"salient: {agg['salient_blocks']}  gap: {agg['avg_ratio_gap']:.3f}")
+cog.cogitate("sst2", max_epochs=EPOCHS_PER_TASK, use_zstd_gating=GATE_ENABLED)
 
 val_sst2_1 = validate(stream.model, "sst2")
-print(f"\n  SST-2 final: {val_sst2_1:.2f}%")
+print(f"\n  SST-2 final: {val_sst2_1:.2f}%  ({time.time() - t0:.0f}s)")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -272,54 +244,39 @@ print("=" * 60)
 n = cog.ingest_glue("mnli", limit=None, seed=42)
 print(f"  {n} prompts ingested")
 
-for epoch in range(1, EPOCHS + 1):
-    print(f"\n  --- Epoch {epoch}/{EPOCHS} ---")
-    shrink_all(model)
-    cog.cogitate("mnli", max_epochs=1, use_zstd_gating=True)
-    post_step_all(model)
+cog._current_task = "mnli"
 
-    acc = validate(model, "mnli")
-    elapsed = time.time() - t0
-    metrics = collect_epoch_metrics(model, cog, "mnli", epoch, acc, elapsed)
-    _log(log_path, metrics)
-
-    agg = metrics["aggregate"]
-    print(f"  val acc: {acc:.2f}%  novelty: {agg['avg_novelty']:.3f}  "
-          f"salient: {agg['salient_blocks']}  gap: {agg['avg_ratio_gap']:.3f}")
+cog.cogitate("mnli", max_epochs=EPOCHS_PER_TASK, use_zstd_gating=GATE_ENABLED)
 
 val_mnli = validate(stream.model, "mnli")
-print(f"\n  MNLI final: {val_mnli:.2f}%")
+print(f"\n  MNLI final: {val_mnli:.2f}%  ({time.time() - t0:.0f}s)")
 
 
 # ═══════════════════════════════════════════════════════════════
 # Phase 3: Re-validate SST-2
 # ═══════════════════════════════════════════════════════════════
 print("\n" + "=" * 60)
-print("  Phase 3 — Re-validate SST-2 (no retraining)")
+print("  Phase 3 — Re-validate SST-2")
 print("=" * 60)
 
 val_sst2_2 = validate(stream.model, "sst2")
 delta = val_sst2_2 - val_sst2_1
 
-# Final metrics snapshot
-final_metrics = collect_epoch_metrics(model, cog, "sst2", EPOCHS, val_sst2_2, time.time() - t0)
-final_metrics["phase"] = "final"
+print(f"\n  SST-2 Phase 1: {val_sst2_1:.2f}%")
+print(f"  SST-2 Phase 3: {val_sst2_2:.2f}%")
+print(f"  Delta:         {delta:+.2f}%")
+print(f"  MNLI:          {val_mnli:.2f}%")
 
-print(f"\n  SST-2 after Phase 1:  {val_sst2_1:.2f}%")
-print(f"  SST-2 after Phase 3:  {val_sst2_2:.2f}%")
-print(f"  Delta:                {delta:+.2f}%")
-print(f"  MNLI:                 {val_mnli:.2f}%")
-
-# ── Save summary ──
 summary = {
     "run_id": RUN_ID,
     "config": {
-        "mode": config.mode,
-        "salience_threshold": config.zstd_salience_threshold,
-        "epochs_per_task": EPOCHS,
-        "zstd_gate_threshold": cog.zstd_gate_threshold,
-        "body_lr": 2e-5,
-        "head_lr": 1e-3,
+        "post_step_interval": POST_STEP_INTERVAL,
+        "reindex_interval": REINDEX_INTERVAL,
+        "calibration_multiplier": CALIBRATION_MULTIPLIER,
+        "gate_enabled": GATE_ENABLED,
+        "gate_threshold": GATE_THRESHOLD,
+        "epochs_per_task": EPOCHS_PER_TASK,
+        "mode": "zpackr",
     },
     "results": {
         "sst2_phase1": round(val_sst2_1, 2),
@@ -327,19 +284,14 @@ summary = {
         "sst2_delta": round(delta, 2),
         "mnli": round(val_mnli, 2),
     },
-    "final_layer_metrics": final_metrics["per_layer"],
-    "aggregate": final_metrics["aggregate"],
-    "zstd_gating": final_metrics["zstd_gating"],
 }
 
 with open(os.path.join(OUT_DIR, "summary.json"), "w") as f:
     json.dump(summary, f, indent=2)
 
-# HTML-safe version of the training log tabulated
-print(f"\n  Saved to: {OUT_DIR}")
-print(f"  Files: training_log.jsonl, summary.json")
+print(f"\n  Saved: {OUT_DIR}")
 
 if abs(delta) < 1.0 and val_mnli > 50.0:
-    print(f"\n  PASS — SST-2 preserved ({abs(delta):.2f}% < 1%), MNLI learned ({val_mnli:.1f}%)")
+    print(f"  PASS — SST-2 preserved ({abs(delta):.2f}% < 1%), MNLI learned ({val_mnli:.1f}%)")
 else:
-    print(f"\n  Needs investigation — delta={delta:+.2f}%, MNLI={val_mnli:.1f}%")
+    print(f"  Needs investigation")
