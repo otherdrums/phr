@@ -17,7 +17,7 @@ from dataclasses import dataclass, asdict
 
 METHOD_CONFIGS = {
     "full":   {"body_lr": 2e-5, "head_lr": 2e-5, "weight_decay": 0.01},
-    "phr":    {"body_lr": 2e-5, "head_lr": 1e-3, "weight_decay": 0.0},
+    "packr":    {"body_lr": 2e-5, "head_lr": 1e-3, "weight_decay": 0.0},
     "lora":   {"body_lr": 5e-4, "head_lr": 5e-4, "weight_decay": 0.0},
     "qlora":  {"body_lr": 5e-4, "head_lr": 5e-4, "weight_decay": 0.0},
     "bitfit": {"body_lr": 2e-3, "head_lr": 2e-3, "weight_decay": 0.0},

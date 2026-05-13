@@ -86,7 +86,7 @@ def _save_model(model, method_key, metrics, idle_vram, num_labels=2, task="sst2"
     _bake_model(model, method_key, out_dir, num_labels)
 
     # PHR-specific: dump layer stats
-    if method_key == "phr":
+    if method_key == "packr":
         _dump_phr_stats(model, out_dir)
 
     print(f"  Saved: {out_dir}")
@@ -100,7 +100,7 @@ def _bake_model(model, method_key, out_dir, num_labels=2):
     baked_dir = os.path.join(out_dir, "baked")
     os.makedirs(baked_dir, exist_ok=True)
 
-    if method_key == "phr":
+    if method_key == "packr":
         _bake_phr(model, out_dir)
     elif method_key in ("lora", "qlora"):
         try:
@@ -463,7 +463,7 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False, 
     print(f"\n\n{'='*100}")
     print(f"  FULL-WEIGHT TRAINING  ({task_label} - same parameters, different storage)")
     print(f"{'='*100}")
-    _print_table({k: r for k, r in results.items() if k in ("full", "phr")})
+    _print_table({k: r for k, r in results.items() if k in ("full", "packr")})
 
     print(f"\n{'='*100}")
     print(f"  PARAMETER-EFFICIENT TRAINING  ({task_label} - fewer trainable parameters)")

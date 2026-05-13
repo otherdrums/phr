@@ -23,7 +23,7 @@ This repository depends on two standalone MIT-licensed libraries:
 ```
 tests/
 ├── harness.py              SST-2 / MNLI comparison harness (packr mode)
-├── configs.py              Method builders: full, lora, qlora, bitfit, phr
+├── configs.py              Method builders: full, lora, qlora, bitfit, packr
 ├── training.py             Shared train/eval loop
 ├── training_config.py      Hyperparameter defaults
 ├── analyzer.py             Post-hoc result tables + charts
@@ -42,9 +42,9 @@ results/                    Saved training artifacts and metrics
 
 **PackR mode** (stable harness path):
 ```bash
-python -m tests.harness --method=phr --quick
-python -m tests.harness --method=phr --epochs=5
-python -m tests.harness --method=phr --cv2lrt
+python -m tests.harness --method=packr --quick
+python -m tests.harness --method=packr --epochs=5
+python -m tests.harness --method=packr --cv2lrt
 ```
 Uses `PackRLinear` with 256-entry LUT + bf16 residual.  Optional `VelvetController`
 for adaptive per-layer learning rates.

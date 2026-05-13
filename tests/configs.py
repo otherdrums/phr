@@ -97,7 +97,7 @@ def build_qlora(num_labels=2, seed=42):
 
 
 def build_phr(offload=False, num_labels=2, seed=42):
-    """PHR-compressed FFN layers with 8-bit Adam."""
+    """PackR-compressed FFN layers with 8-bit Adam."""
     torch.manual_seed(seed)
     model = BertForSequenceClassification.from_pretrained(
         "bert-base-uncased", num_labels=num_labels, ignore_mismatched_sizes=True,
@@ -201,7 +201,7 @@ def _param_group_key(name, granularity="matrix"):
 
 
 def build_phr_cv2lrt(offload=False, num_labels=2, seed=42):
-    """PHR-compressed FFN layers with per-module parameter groups for CV2LRT."""
+    """PackR-compressed FFN layers with per-module parameter groups for CV2LRT."""
     torch.manual_seed(seed)
     model = BertForSequenceClassification.from_pretrained(
         "bert-base-uncased", num_labels=num_labels, ignore_mismatched_sizes=True,
@@ -262,7 +262,7 @@ def count_trainable(model):
 
 
 METHODS = [
-    ("phr",     "PHR (ours)",       build_phr),
+    ("packr",     "PackR (ours)",       build_phr),
     ("full",    "Full Fine-tune",   build_full_finetune),
     ("bitfit",  "BitFit",           build_bitfit),
     ("lora",    "LoRA (r=8)",       build_lora),

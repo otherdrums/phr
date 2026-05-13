@@ -57,7 +57,7 @@ Depends on: `packr @ feature/zpackr` (MIT-licensed, `pip install -e /path/to/pac
 
 Uses the 256-entry LUT + bf16 residual.  Requires `VelvetController` (or the
 legacy `CV2LRTController` alias) for adaptive per-layer learning rates.
-Identical to the original PHR harness behavior.
+Identical to the original PackR harness behavior.
 
 ### ZPackR (mode="zpackr") — Default for StreamCC v2
 
@@ -247,9 +247,9 @@ Phase 3: SST-2 delta < 1% from Phase 1 (knowledge preserved)
 The original harness still works on the `feature/streamcc-v2` branch:
 
 ```bash
-python -m tests.harness --method=phr --quick
-python -m tests.harness --method=phr --epochs=5
-python -m tests.harness --method=phr --cv2lrt
+python -m tests.harness --method=packr --quick
+python -m tests.harness --method=packr --epochs=5
+python -m tests.harness --method=packr --cv2lrt
 ```
 
 This uses `mode="packr"` (PackRLinear + VelvetController) — unaffected by
@@ -285,5 +285,5 @@ carry some semantic structure across domains.  This is measured as
 
 ## License
 
-StreamCC v2 is part of the `phr` research repository (AGPLv3).  
+StreamCC is part of the `packr-research` repository (AGPLv3).  
 PackR is a separate MIT-licensed library at `github.com/otherdrums/packr`.

@@ -98,7 +98,7 @@ def load_runs(results_dir: Path) -> list[RunData]:
         _TRAIN_SAMPLES = {"sst2": 42190, "mnli": 392702}
         rd.samples_per_sec = (_TRAIN_SAMPLES.get(rd.task, 42190) * rd.epochs) / max(rd.total_time_s, 1)
 
-        # Load layer_stats for PHR runs
+        # Load layer_stats for PackR runs
         layer_path = d / "layer_stats.json"
         if layer_path.exists():
             with open(layer_path) as f:
@@ -178,19 +178,19 @@ def generate_efficiency_table(runs: list[RunData]) -> str:
     return "\n".join(lines)
 
 
-def generate_phr_layer_table(runs: list[RunData]) -> str:
-    """Per-layer PHR statistics comparison."""
-    phr_runs = [r for r in runs if r.method == "phr" and r.layer_stats]
-    if len(phr_runs) < 2:
+def generate_packr_layer_table(runs: list[RunData]) -> str:
+    """Per-layer PackR statistics comparison."""
+    packr_runs = [r for r in runs if r.method == "packr" and r.layer_stats]
+    if len(packr_runs) < 2:
         return ""
 
     # Sort by val_acc: better run = "new", worse run = "old"
-    phr_runs.sort(key=lambda r: r.val_acc, reverse=True)
-    new_run, old_run = phr_runs[0], phr_runs[1]
+    packr_runs.sort(key=lambda r: r.val_acc, reverse=True)
+    new_run, old_run = packr_runs[0], packr_runs[1]
 
     lines = [
         "",
-        "## PHR Layer Statistics (old vs current)",
+        "## PackR Layer Statistics (old vs current)",
         "",
         "| Layer | Old residual_ratio | New residual_ratio | Δ Ratio | Old LUT used | New LUT used |",
         "|-------|-------------------:|-------------------:|:------:|:----------:|:----------:|",
@@ -242,7 +242,7 @@ def generate_full_markdown(runs: list[RunData]) -> str:
         generate_comparison_table(runs),
         generate_efficiency_table(runs),
         generate_config_table(runs),
-        generate_phr_layer_table(runs),
+        generate_packr_layer_table(runs),
         "",
         "---",
         "",
@@ -254,10 +254,10 @@ def generate_full_markdown(runs: list[RunData]) -> str:
 # ── JSON summary ──
 
 def generate_json_summary(runs: list[RunData]) -> dict:
-    phr_runs = [r for r in runs if r.method == "phr" and r.layer_stats]
-    phr_layer_summary = {}
-    if phr_runs:
-        latest = phr_runs[0]
+    packr_runs = [r for r in runs if r.method == "packr" and r.layer_stats]
+    packr_layer_summary = {}
+    if packr_runs:
+        latest = packr_runs[0]
         layer_avg = {"residual_ratio": 0, "lut_entries_used": 0}
         n = 0
         for stats in latest.layer_stats.values():
@@ -267,7 +267,7 @@ def generate_json_summary(runs: list[RunData]) -> dict:
         if n > 0:
             layer_avg["residual_ratio"] /= n
             layer_avg["lut_entries_used"] /= n
-        phr_layer_summary = {
+        packr_layer_summary = {
             "num_layers": n,
             "avg_residual_ratio": round(layer_avg["residual_ratio"], 5),
             "avg_lut_entries_used": round(layer_avg["lut_entries_used"], 1),
@@ -299,7 +299,7 @@ def generate_json_summary(runs: list[RunData]) -> dict:
             }
             for r in runs
         ],
-        "phr_layer_summary": phr_layer_summary,
+        "packr_layer_summary": packr_layer_summary,
         "_notes": {
             "acc_gap_vs_full_pct": "Positive = better than full fine-tune, negative = worse",
             "acc_per_gb": "Val accuracy per GB VRAM — higher = more memory-efficient",
@@ -328,7 +328,7 @@ def plot_val_acc_bar(runs: list[RunData], output_dir: Path):
     sorted_runs = sorted(runs, key=lambda r: r.val_acc, reverse=True)
     methods = [r.method for r in sorted_runs]
     vals = [r.val_acc for r in sorted_runs]
-    colors = ["#2ecc71" if m == "phr" else "#3498db" if m == "full" else "#95a5a6" for m in methods]
+    colors = ["#2ecc71" if m == "packr" else "#3498db" if m == "full" else "#95a5a6" for m in methods]
 
     fig, ax = plt.subplots(figsize=(8, 5))
     bars = ax.bar(methods, vals, color=colors, edgecolor="white", linewidth=0.5)
@@ -355,8 +355,8 @@ def plot_efficiency_scatter(runs: list[RunData], output_dir: Path):
     fig, ax = plt.subplots(figsize=(9, 6))
 
     for rd in runs:
-        color = "#2ecc71" if rd.method == "phr" else "#e74c3c" if rd.method == "full" else "#3498db"
-        marker = "s" if rd.method == "phr" else "o"
+        color = "#2ecc71" if rd.method == "packr" else "#e74c3c" if rd.method == "full" else "#3498db"
+        marker = "s" if rd.method == "packr" else "o"
         size = max(rd.trainable_params_m * 1.5, 40) if rd.trainable_params_m > 0 else 60
         ax.scatter(rd.val_acc, rd.acc_per_gb, s=size, c=color, marker=marker,
                    edgecolors="white", linewidth=0.5, zorder=5, alpha=0.85)
@@ -371,19 +371,19 @@ def plot_efficiency_scatter(runs: list[RunData], output_dir: Path):
     plt.close(fig)
 
 
-def plot_phr_layer_profile(runs: list[RunData], output_dir: Path):
-    """Line chart: residual_ratio per layer for PHR runs."""
-    phr_runs = [r for r in runs if r.method == "phr" and r.layer_stats]
-    if not phr_runs:
+def plot_packr_layer_profile(runs: list[RunData], output_dir: Path):
+    """Line chart: residual_ratio per layer for PackR runs."""
+    packr_runs = [r for r in runs if r.method == "packr" and r.layer_stats]
+    if not packr_runs:
         return
 
     plt = _setup_mpl()
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
 
     colors = ["#2ecc71", "#3498db"]
-    labels = [f"PHR ({r.commit[:7]})" for r in phr_runs]
+    labels = [f"PackR ({r.commit[:7]})" for r in packr_runs]
 
-    for idx, rd in enumerate(phr_runs):
+    for idx, rd in enumerate(packr_runs):
         layer_names = list(rd.layer_stats.keys())
         ratios = [rd.layer_stats[n].get("residual_ratio", 0) for n in layer_names]
         entries = [rd.layer_stats[n].get("lut_entries_used", 0) for n in layer_names]
@@ -393,7 +393,7 @@ def plot_phr_layer_profile(runs: list[RunData], output_dir: Path):
         ax2.plot(x, entries, marker=".", color=colors[idx], label=labels[idx], markersize=4)
 
     ax1.set_ylabel("Residual Ratio (W_f / LUT)")
-    ax1.set_title("PHR Layer Profile: Residual Contribution vs LUT Entries Used")
+    ax1.set_title("PackR Layer Profile: Residual Contribution vs LUT Entries Used")
     ax1.legend(fontsize=8)
     ax1.grid(True, alpha=0.3)
 
@@ -402,15 +402,15 @@ def plot_phr_layer_profile(runs: list[RunData], output_dir: Path):
     ax2.legend(fontsize=8)
     ax2.grid(True, alpha=0.3)
 
-    fig.savefig(output_dir / "phr_layer_profile.png")
+    fig.savefig(output_dir / "packr_layer_profile.png")
     plt.close(fig)
 
 
 def plot_lut_heatmap(runs: list[RunData], output_dir: Path):
-    phr_runs = [r for r in runs if r.method == "phr" and r.layer_stats]
-    if not phr_runs:
+    packr_runs = [r for r in runs if r.method == "packr" and r.layer_stats]
+    if not packr_runs:
         return
-    rd = phr_runs[0]  # latest PHR run
+    rd = packr_runs[0]  # latest PackR run
 
     plt = _setup_mpl()
     import numpy as np
@@ -432,7 +432,7 @@ def plot_lut_heatmap(runs: list[RunData], output_dir: Path):
 
     ax.set_xlabel("Layer Index")
     ax.set_ylabel("LUT Entry Index (0–255)")
-    ax.set_title("PHR LUT Entry Usage Heatmap (log scale)")
+    ax.set_title("PackR LUT Entry Usage Heatmap (log scale)")
 
     cbar = fig.colorbar(im, ax=ax, shrink=0.8)
     cbar.set_label("log(1 + usage count)")
@@ -447,10 +447,10 @@ def plot_lut_heatmap(runs: list[RunData], output_dir: Path):
 
 
 def plot_dead_entries(runs: list[RunData], output_dir: Path):
-    phr_runs = [r for r in runs if r.method == "phr" and r.layer_stats]
-    if not phr_runs:
+    packr_runs = [r for r in runs if r.method == "packr" and r.layer_stats]
+    if not packr_runs:
         return
-    rd = phr_runs[0]
+    rd = packr_runs[0]
 
     plt = _setup_mpl()
     import numpy as np
@@ -471,7 +471,7 @@ def plot_dead_entries(runs: list[RunData], output_dir: Path):
 
     ax.set_xlabel("LUT Entry Index (0–255)")
     ax.set_ylabel("Number of Layers Where Entry is Dead")
-    ax.set_title(f"PHR Dead LUT Entries Across {len(layer_names)} Layers "
+    ax.set_title(f"PackR Dead LUT Entries Across {len(layer_names)} Layers "
                  f"({sum(1 for c in dead_counts if c == len(layer_names))} entries dead in ALL layers)")
 
     fig.savefig(output_dir / "dead_entries.png")
@@ -482,7 +482,7 @@ def generate_all_plots(runs: list[RunData], output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
     plot_val_acc_bar(runs, output_dir)
     plot_efficiency_scatter(runs, output_dir)
-    plot_phr_layer_profile(runs, output_dir)
+    plot_packr_layer_profile(runs, output_dir)
     plot_lut_heatmap(runs, output_dir)
     plot_dead_entries(runs, output_dir)
 
