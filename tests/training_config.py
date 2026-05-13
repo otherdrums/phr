@@ -45,13 +45,13 @@ class TrainingConfig:
     warmup_start_factor: float = 0.1
     decay_eta_min: float = 0.1
 
-    # ── CV2LRT adaptive scheduler ──
-    cv2lrt_enabled: bool = False
-    cv2lrt_beta: float = 0.97
-    cv2lrt_min_multiplier: float = 0.175
-    cv2lrt_max_multiplier: float = 1.0
-    cv2lrt_velocity_scale: float = 10.0
-    cv2lrt_granularity: str = "matrix"   # "coarse" | "layer" | "matrix"
+    # ── Velvet adaptive scheduler ──
+    velvet_enabled: bool = False
+    velvet_beta: float = 0.97
+    velvet_min_multiplier: float = 0.175
+    velvet_max_multiplier: float = 1.0
+    velvet_velocity_scale: float = 10.0
+    velvet_granularity: str = "matrix"   # "coarse" | "layer" | "matrix"
 
     # ── Training loop ──
     epochs: int = 5

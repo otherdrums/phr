@@ -200,8 +200,8 @@ def _param_group_key(name, granularity="matrix"):
     return ".".join(name.split(".")[:-1])
 
 
-def build_phr_cv2lrt(offload=False, num_labels=2, seed=42):
-    """PackR-compressed FFN layers with per-module parameter groups for CV2LRT."""
+def build_phr_velvet(offload=False, num_labels=2, seed=42):
+    """PackR-compressed FFN layers with per-module parameter groups for Velvet."""
     torch.manual_seed(seed)
     model = BertForSequenceClassification.from_pretrained(
         "bert-base-uncased", num_labels=num_labels, ignore_mismatched_sizes=True,
@@ -216,7 +216,7 @@ def build_phr_cv2lrt(offload=False, num_labels=2, seed=42):
     )
     model = compress_model(model, phr_cfg)
 
-    granularity = _cfg.cv2lrt_granularity
+    granularity = _cfg.velvet_granularity
 
     # Collect params by group key
     head_params = []

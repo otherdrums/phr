@@ -249,7 +249,7 @@ The original harness still works on the `feature/streamcc-v2` branch:
 ```bash
 python -m tests.harness --method=packr --quick
 python -m tests.harness --method=packr --epochs=5
-python -m tests.harness --method=packr --cv2lrt
+python -m tests.harness --method=packr --velvet
 ```
 
 This uses `mode="packr"` (PackRLinear + VelvetController) — unaffected by

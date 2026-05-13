@@ -44,7 +44,7 @@ results/                    Saved training artifacts and metrics
 ```bash
 python -m tests.harness --method=packr --quick
 python -m tests.harness --method=packr --epochs=5
-python -m tests.harness --method=packr --cv2lrt
+python -m tests.harness --method=packr --velvet
 ```
 Uses `PackRLinear` with 256-entry LUT + bf16 residual.  Optional `VelvetController`
 for adaptive per-layer learning rates.

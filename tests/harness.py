@@ -22,12 +22,12 @@ import transformers, datasets
 transformers.logging.set_verbosity_error()
 datasets.disable_progress_bar()
 
-from .configs import METHODS, build_optimizer, count_trainable, build_phr_cv2lrt
+from .configs import METHODS, build_optimizer, count_trainable, build_phr_velvet
 from .training import train_one_epoch, evaluate
 from .memory_tracker import MemoryTracker, gpu_used_mb
 from .training_config import TrainingConfig
 from torch.optim.lr_scheduler import LinearLR, SequentialLR, LambdaLR
-from packr import CV2LRTController
+from packr import VelvetController
 import math
 
 _TASK_META = {
@@ -193,10 +193,10 @@ def _cleanup():
     torch.cuda.synchronize()
 
 
-def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False, task="sst2", seed=42):
+def run(quick=False, method_filter=None, epochs=5, offload=False, velvet=False, task="sst2", seed=42):
     cfg = TrainingConfig(epochs=epochs)
-    if cv2lrt:
-        cfg.cv2lrt_enabled = True
+    if velvet:
+        cfg.velvet_enabled = True
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     total_vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
@@ -270,8 +270,8 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False, 
         try:
             # Suppress model loading progress bars (stderr)
             with redirect_stderr(io.StringIO()):
-                if method_key == "phr" and cfg.cv2lrt_enabled:
-                    model, prebuilt_opt = build_phr_cv2lrt(offload=offload, num_labels=num_labels, seed=seed)
+                if method_key == "packr" and cfg.velvet_enabled:
+                    model, prebuilt_opt = build_phr_velvet(offload=offload, num_labels=num_labels, seed=seed)
                 elif method_key == "phr":
                     model, prebuilt_opt = build_fn(offload=offload, num_labels=num_labels, seed=seed)
                 else:
@@ -293,19 +293,19 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False, 
             total_micro_steps = steps_per_epoch * cfg.epochs
             warmup_steps = int(cfg.warmup_fraction * total_micro_steps)
 
-            cv2lrt = None
+            velvet_ctrl = None
             scheduler = None
 
-            if cfg.cv2lrt_enabled and method_key == "phr":
-                cv2lrt = CV2LRTController(
+            if cfg.velvet_enabled and method_key == "packr":
+                velvet_ctrl = VelvetController(
                     optimizer,
-                    beta=cfg.cv2lrt_beta,
-                    min_multiplier=cfg.cv2lrt_min_multiplier,
-                    max_multiplier=cfg.cv2lrt_max_multiplier,
-                    velocity_scale=cfg.cv2lrt_velocity_scale,
+                    beta=cfg.velvet_beta,
+                    min_multiplier=cfg.velvet_min_multiplier,
+                    max_multiplier=cfg.velvet_max_multiplier,
+                    velocity_scale=cfg.velvet_velocity_scale,
                 )
-                print(f"  CV2LRT:      enabled (β={cfg.cv2lrt_beta}, "
-                      f"granularity={cfg.cv2lrt_granularity}, "
+                print(f"  Velvet:      enabled (β={cfg.velvet_beta}, "
+                      f"granularity={cfg.velvet_granularity}, "
                       f"{len(optimizer.param_groups)} groups)")
             else:
                 hold_start = int(cfg.hold_fraction * total_micro_steps)
@@ -378,7 +378,7 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False, 
                         model, train_loader, optimizer, epoch, device,
                         acc_steps=ACC_STEPS, val_loader=val_loader,
                         val_steps=val_steps, tracker=tracker,
-                        scheduler=scheduler, cv2lrt=cv2lrt,
+                        scheduler=scheduler, cv2lrt=velvet_ctrl,
                         warmup_steps=warmup_steps,
                         steps_per_epoch=steps_per_epoch,
                         log_path=log_path,
@@ -433,16 +433,16 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, cv2lrt=False, 
             }
             if mismatched_acc is not None:
                 save_metrics["val_acc_mismatched"] = mismatched_acc
-            if cv2lrt is not None:
-                save_metrics["cv2lrt"] = {
+            if velvet_ctrl is not None:
+                save_metrics["velvet"] = {
                     "enabled": True,
-                    "beta": cfg.cv2lrt_beta,
-                    "min_multiplier": cfg.cv2lrt_min_multiplier,
-                    "max_multiplier": cfg.cv2lrt_max_multiplier,
-                    "velocity_scale": cfg.cv2lrt_velocity_scale,
-                    "granularity": cfg.cv2lrt_granularity,
+                    "beta": cfg.velvet_beta,
+                    "min_multiplier": cfg.velvet_min_multiplier,
+                    "max_multiplier": cfg.velvet_max_multiplier,
+                    "velocity_scale": cfg.velvet_velocity_scale,
+                    "granularity": cfg.velvet_granularity,
                     "num_groups": len(optimizer.param_groups),
-                    "final_stats": cv2lrt.get_stats(),
+                    "final_stats": velvet_ctrl.get_stats(),
                 }
             _save_model(model, method_key, save_metrics, method_idle_vram, num_labels=num_labels, task=task, seed=seed)
 
@@ -502,7 +502,7 @@ if __name__ == "__main__":
     quick = "--quick" in sys.argv
     run_all = "--all" in sys.argv
     offload = "--offload" in sys.argv
-    cv2lrt = "--cv2lrt" in sys.argv
+    velvet = "--velvet" in sys.argv
     method_filter = None
     epochs = 5
     task = "sst2"
@@ -518,4 +518,4 @@ if __name__ == "__main__":
             seed = int(arg.split("=")[1])
     if run_all:
         method_filter = None
-    run(quick=quick, method_filter=method_filter, epochs=epochs, offload=offload, cv2lrt=cv2lrt, task=task, seed=seed)
+    run(quick=quick, method_filter=method_filter, epochs=epochs, offload=offload, velvet=velvet, task=task, seed=seed)
