@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from transformers import BertForSequenceClassification
 
-from phr import compress_model, PHRConfig, FusedQuantizedAdam
+from packr import compress_model, PHRConfig, FusedQuantizedAdam
 from .training_config import TrainingConfig, method_lr_config
 
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"

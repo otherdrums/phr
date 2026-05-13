@@ -27,7 +27,7 @@ from .training import train_one_epoch, evaluate
 from .memory_tracker import MemoryTracker, gpu_used_mb
 from .training_config import TrainingConfig
 from torch.optim.lr_scheduler import LinearLR, SequentialLR, LambdaLR
-from phr.cv2lrt import CV2LRTController
+from packr import CV2LRTController
 import math
 
 _TASK_META = {
@@ -69,7 +69,7 @@ RUN_ID = f"{_COMMIT}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 def _save_model(model, method_key, metrics, idle_vram, num_labels=2, task="sst2", seed=42):
     """Save model, metrics, and baked standard HuggingFace model."""
     import json
-    from phr import PHRLinear
+    from packr import PHRLinear
 
     out_dir = os.path.join(RESULTS_DIR, f"{task}_{method_key}_seed{seed}_{RUN_ID}")
     os.makedirs(out_dir, exist_ok=True)
@@ -95,7 +95,7 @@ def _save_model(model, method_key, metrics, idle_vram, num_labels=2, task="sst2"
 def _bake_model(model, method_key, out_dir, num_labels=2):
     """Produce a standard HuggingFace baked/ model from the trained model."""
     import torch.nn as nn
-    from phr import PHRLinear
+    from packr import PHRLinear
 
     baked_dir = os.path.join(out_dir, "baked")
     os.makedirs(baked_dir, exist_ok=True)
@@ -131,7 +131,7 @@ def _bake_phr(model, out_dir):
     """Materialize PHR weights → standard nn.Linear and save via save_pretrained."""
     import copy
     import torch.nn as nn
-    from phr import PHRLinear
+    from packr import PHRLinear
 
     baked_dir = os.path.join(out_dir, "baked")
     os.makedirs(baked_dir, exist_ok=True)
@@ -159,7 +159,7 @@ def _bake_phr(model, out_dir):
 def _dump_phr_stats(model, out_dir):
     """Per-layer PHR statistics: LUT usage, residual magnitude, viability."""
     import json
-    from phr import PHRLinear
+    from packr import PHRLinear
 
     layer_stats = {}
     for name, m in model.named_modules():

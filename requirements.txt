@@ -5,3 +5,5 @@ datasets>=2.14.0
 nvidia-ml-py>=12.0.0
 matplotlib>=3.7.0
 peft>=0.7.0
+# PackR (MIT-licensed drop-in nn.Linear replacement)
+# pip install -e /path/to/packr   or   pip install git+https://github.com/otherdrums/packr.git
