@@ -13,6 +13,7 @@ os.environ["DATASETS_VERBOSITY"] = "error"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
+import torch.nn as nn
 import subprocess
 from contextlib import redirect_stderr
 from torch.utils.data import DataLoader
@@ -23,7 +24,7 @@ transformers.logging.set_verbosity_error()
 datasets.disable_progress_bar()
 
 from .configs import METHODS, build_optimizer, count_trainable, build_phr_velvet
-from .training import train_one_epoch, evaluate
+from .training import train_one_epoch, evaluate, evaluate_regression, evaluate_mcc
 from .memory_tracker import MemoryTracker, gpu_used_mb
 from .training_config import TrainingConfig
 from torch.optim.lr_scheduler import LinearLR, SequentialLR, LambdaLR
@@ -36,12 +37,72 @@ _TASK_META = {
         "dataset_name": "sst2",
         "train_samples": 42190,
         "val_splits": ["validation"],
+        "task_type": "classification",
+        "input_cols": ["sentence"],
     },
     "mnli": {
         "num_labels": 3,
         "dataset_name": "mnli",
         "train_samples": 392702,
         "val_splits": ["validation_matched", "validation_mismatched"],
+        "task_type": "classification",
+        "input_cols": ["premise", "hypothesis"],
+    },
+    "cola": {
+        "num_labels": 2,
+        "dataset_name": "cola",
+        "train_samples": 8551,
+        "val_splits": ["validation"],
+        "task_type": "classification",
+        "input_cols": ["sentence"],
+    },
+    "mrpc": {
+        "num_labels": 2,
+        "dataset_name": "mrpc",
+        "train_samples": 3668,
+        "val_splits": ["validation"],
+        "task_type": "classification",
+        "input_cols": ["sentence1", "sentence2"],
+    },
+    "qqp": {
+        "num_labels": 2,
+        "dataset_name": "qqp",
+        "train_samples": 363846,
+        "val_splits": ["validation"],
+        "task_type": "classification",
+        "input_cols": ["question1", "question2"],
+    },
+    "qnli": {
+        "num_labels": 2,
+        "dataset_name": "qnli",
+        "train_samples": 104743,
+        "val_splits": ["validation"],
+        "task_type": "classification",
+        "input_cols": ["question", "sentence"],
+    },
+    "rte": {
+        "num_labels": 2,
+        "dataset_name": "rte",
+        "train_samples": 2490,
+        "val_splits": ["validation"],
+        "task_type": "classification",
+        "input_cols": ["sentence1", "sentence2"],
+    },
+    "wnli": {
+        "num_labels": 2,
+        "dataset_name": "wnli",
+        "train_samples": 635,
+        "val_splits": ["validation"],
+        "task_type": "classification",
+        "input_cols": ["sentence1", "sentence2"],
+    },
+    "stsb": {
+        "num_labels": 1,
+        "dataset_name": "stsb",
+        "train_samples": 5749,
+        "val_splits": ["validation"],
+        "task_type": "regression",
+        "input_cols": ["sentence1", "sentence2"],
     },
 }
 
@@ -216,17 +277,15 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, velvet=False, 
     meta = _TASK_META[task]
     num_labels = meta["num_labels"]
 
-    if task == "mnli":
-        def tok(batch):
-            return tokenizer(
-                batch["premise"], batch["hypothesis"],
-                truncation=True, padding="max_length", max_length=128
-            )
-    else:
-        def tok(batch):
-            return tokenizer(
-                batch["sentence"], truncation=True, padding="max_length", max_length=128
-            )
+    is_regression = meta.get("task_type") == "regression"
+    is_cola = task == "cola"
+    input_cols = meta["input_cols"]
+
+    def tok(batch):
+        texts = [batch[col] for col in input_cols]
+        return tokenizer(
+            *texts, truncation=True, padding="max_length", max_length=128
+        )
 
     dataset = load_dataset("glue", meta["dataset_name"])
     dataset = dataset.map(tok, batched=True).with_format(
@@ -299,14 +358,21 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, velvet=False, 
             if cfg.velvet_enabled and method_key == "packr":
                 velvet_ctrl = VelvetController(
                     optimizer,
-                    beta=cfg.velvet_beta,
-                    min_multiplier=cfg.velvet_min_multiplier,
+                    beta=None,
+                    min_multiplier=None,
                     max_multiplier=cfg.velvet_max_multiplier,
-                    velocity_scale=cfg.velvet_velocity_scale,
+                    velocity_scale=None,
+                    train_samples=meta["train_samples"],
                 )
-                print(f"  Velvet:      enabled (β={cfg.velvet_beta}, "
-                      f"granularity={cfg.velvet_granularity}, "
-                      f"{len(optimizer.param_groups)} groups)")
+                vs = velvet_ctrl.get_stats()
+                print(f"  Velvet:      enabled (β={vs['beta']:.3f}, "
+                      f"v_ref_β={vs.get('v_ref_beta',0):.3f}, "
+                      f"vel_scale={vs['vel_scale']:.1f}, "
+                      f"min_m={vs['min_multiplier']:.3f}, "
+                      f"obs={vs.get('observation_steps',1)}, "
+                      f"gran={cfg.velvet_granularity}, "
+                      f"{len(optimizer.param_groups)} groups, "
+                      f"{meta['train_samples']} samples)")
             else:
                 hold_start = int(cfg.hold_fraction * total_micro_steps)
                 scheduler = SequentialLR(
@@ -328,6 +394,9 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, velvet=False, 
             oom = False
             mismatched_acc = None
 
+            if velvet and method_key == "packr":
+                method_key = "packr_va"
+
             out_dir = os.path.join(RESULTS_DIR, f"{task}_{method_key}_seed{seed}_{RUN_ID}")
             os.makedirs(out_dir, exist_ok=True)
             log_path = os.path.join(out_dir, "training_log.jsonl")
@@ -343,7 +412,10 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, velvet=False, 
                     mask = batch["attention_mask"].to(device)
                     labels = batch["label"].to(device)
                     outputs = model(input_ids=ids, attention_mask=mask)
-                    loss = torch.nn.functional.cross_entropy(outputs.logits, labels) / ACC_STEPS
+                    if is_regression:
+                        loss = nn.functional.mse_loss(outputs.logits, labels.float().unsqueeze(-1)) / ACC_STEPS
+                    else:
+                        loss = nn.functional.cross_entropy(outputs.logits, labels) / ACC_STEPS
                     loss.backward()
                     if (batch_idx + 1) % ACC_STEPS == 0:
                         optimizer.step()
@@ -353,25 +425,36 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, velvet=False, 
                 peak_torch = tracker.peak_torch_gb()
                 peak_nvml = tracker.peak_nvml_gb()
                 # Quick eval on subset
-                quick_val = 0
                 model.eval()
-                correct_q = 0
-                total_q = 0
-                for i, batch in enumerate(val_loader):
-                    if i >= 5:
-                        break
-                    ids = batch["input_ids"].to(device)
-                    mask = batch["attention_mask"].to(device)
-                    labels = batch["label"].to(device)
-                    with torch.no_grad():
-                        outputs = model(input_ids=ids, attention_mask=mask)
-                    correct_q += (outputs.logits.argmax(-1) == labels).sum().item()
-                    total_q += labels.size(0)
-                final_val_acc = 100.0 * correct_q / total_q if total_q > 0 else 0
+                if is_regression:
+                    quick_val = 0
+                    for i, batch in enumerate(val_loader):
+                        if i >= 5:
+                            break
+                        ids = batch["input_ids"].to(device)
+                        mask = batch["attention_mask"].to(device)
+                        with torch.no_grad():
+                            outputs = model(input_ids=ids, attention_mask=mask)
+                    final_val_acc = 0
+                else:
+                    correct_q = 0
+                    total_q = 0
+                    for i, batch in enumerate(val_loader):
+                        if i >= 5:
+                            break
+                        ids = batch["input_ids"].to(device)
+                        mask = batch["attention_mask"].to(device)
+                        labels = batch["label"].to(device)
+                        with torch.no_grad():
+                            outputs = model(input_ids=ids, attention_mask=mask)
+                        correct_q += (outputs.logits.argmax(-1) == labels).sum().item()
+                        total_q += labels.size(0)
+                    final_val_acc = 100.0 * correct_q / total_q if total_q > 0 else 0
                 best_val_acc = final_val_acc
                 model.train()
                 print(f"  Quick:       {total_time:.1f}s, val {final_val_acc:.2f}%")
             else:
+                criterion = nn.MSELoss() if is_regression else None
                 for epoch in range(1, EPOCHS + 1):
                     t0 = time.time()
                     train_loss, train_acc, val_accs, vram_torch = train_one_epoch(
@@ -382,6 +465,9 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, velvet=False, 
                         warmup_steps=warmup_steps,
                         steps_per_epoch=steps_per_epoch,
                         log_path=log_path,
+                        criterion=criterion,
+                        is_regression=is_regression,
+                        is_cola=is_cola,
                     )
                     epoch_time = time.time() - t0
                     total_time += epoch_time
@@ -390,33 +476,59 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, velvet=False, 
                     peak_nvml = max(peak_nvml, tracker.peak_nvml_gb())
                     cur_val = list(val_accs.values())[-1] if val_accs else 0
                     best_val_acc = max(best_val_acc, cur_val)
+                    if is_cola:
+                        metric_name = "MCC"
+                    elif is_regression:
+                        metric_name = "Corr"
+                    else:
+                        metric_name = "Acc"
                     print(f"  Epoch {epoch} | Loss {train_loss:.4f} | "
-                          f"Acc {train_acc:.2f}% | Val {cur_val:.2f}% | "
+                          f"{metric_name} {train_acc:.2f}% | Val {cur_val:.2f}% | "
                           f"Best {best_val_acc:.2f}% | {epoch_time:.0f}s")
 
-                final_val_acc = evaluate(model, val_loader, device)
+                if is_cola:
+                    final_val_acc = evaluate_mcc(model, val_loader, device)
+                elif is_regression:
+                    final_val_acc = evaluate_regression(model, val_loader, device)
+                else:
+                    final_val_acc = evaluate(model, val_loader, device)
                 best_val_acc = max(best_val_acc, final_val_acc)
                 if task == "mnli":
                     mismatched_acc = evaluate(model, val_loaders["validation_mismatched"], device)
                     best_val_acc = max(best_val_acc, mismatched_acc)
                     print(f"  MNLI Mismatched: {mismatched_acc:.2f}%")
 
+            if is_cola:
+                val_key = "val_mcc"
+            elif is_regression:
+                val_key = "val_corr"
+            else:
+                val_key = "val_acc"
             result_entry = {
                 "name": method_name,
                 "trainable_m": trainable / 1e6,
                 "train_acc": final_train_acc,
-                "val_acc": best_val_acc,
+                val_key: best_val_acc,
                 "vram_gb": peak_nvml,
                 "total_time_s": total_time,
                 "status": "OK",
+                "task_type": meta["task_type"],
             }
             if mismatched_acc is not None:
                 result_entry["val_acc_mismatched"] = mismatched_acc
             results[method_key] = result_entry
-            print(f"  >> Val: {final_val_acc:.2f}% | Best: {best_val_acc:.2f}% | VRAM: {peak_nvml:.2f} GB")
+            if is_cola:
+                metric_label = "MCC"
+            elif is_regression:
+                metric_label = "Corr"
+            else:
+                metric_label = "Val"
+            print(f"  >> {metric_label}: {final_val_acc:.2f}% | Best: {best_val_acc:.2f}% | VRAM: {peak_nvml:.2f} GB")
 
             # Save model + metrics + PHR artifacts
             save_metrics = {
+                val_key: best_val_acc,
+                f"final_{val_key}": final_val_acc,
                 "val_acc": best_val_acc,
                 "final_val_acc": final_val_acc,
                 "train_acc": final_train_acc,
@@ -425,24 +537,27 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, velvet=False, 
                 "total_time_s": total_time,
                 "epochs": EPOCHS,
                 "offload": offload,
-                "format_version": 1,
+                "format_version": 2,
                 "training_config": cfg.to_dict(),
                 "task": task,
+                "task_type": meta["task_type"],
                 "num_labels": num_labels,
                 "seed": seed,
             }
             if mismatched_acc is not None:
                 save_metrics["val_acc_mismatched"] = mismatched_acc
             if velvet_ctrl is not None:
+                vs = velvet_ctrl.get_stats()
                 save_metrics["velvet"] = {
                     "enabled": True,
-                    "beta": cfg.velvet_beta,
-                    "min_multiplier": cfg.velvet_min_multiplier,
-                    "max_multiplier": cfg.velvet_max_multiplier,
-                    "velocity_scale": cfg.velvet_velocity_scale,
+                    "beta": vs["beta"],
+                    "min_multiplier": vs["min_multiplier"],
+                    "max_multiplier": vs["max_multiplier"],
+                    "velocity_scale": vs["vel_scale"],
+                    "auto_tuned": vs.get("auto_tuned", False),
                     "granularity": cfg.velvet_granularity,
                     "num_groups": len(optimizer.param_groups),
-                    "final_stats": velvet_ctrl.get_stats(),
+                    "final_stats": vs,
                 }
             _save_model(model, method_key, save_metrics, method_idle_vram, num_labels=num_labels, task=task, seed=seed)
 
@@ -463,7 +578,7 @@ def run(quick=False, method_filter=None, epochs=5, offload=False, velvet=False, 
     print(f"\n\n{'='*100}")
     print(f"  FULL-WEIGHT TRAINING  ({task_label} - same parameters, different storage)")
     print(f"{'='*100}")
-    _print_table({k: r for k, r in results.items() if k in ("full", "packr")})
+    _print_table({k: r for k, r in results.items() if k in ("full", "packr", "packr_va")})
 
     print(f"\n{'='*100}")
     print(f"  PARAMETER-EFFICIENT TRAINING  ({task_label} - fewer trainable parameters)")
@@ -477,18 +592,26 @@ def _print_table(entries):
     if not entries:
         print("  (no results)")
         return
+    first = list(entries.values())[0]
+    if first.get("task_type") == "regression":
+        val_label = "Val Corr"
+    elif "val_mcc" in first:
+        val_label = "Val MCC"
+    else:
+        val_label = "Val Acc"
     header = (
         f"{'Method':<22} {'Status':<8} {'Train M':>8} "
-        f"{'VRAM':>8} {'Val Acc':>9} {'Time':>7} {'Acc/GB':>8}"
+        f"{'VRAM':>8} {val_label:>9} {'Time':>7} {'Acc/GB':>8}"
     )
     print(header)
     print("-" * 90)
     for r in entries.values():
         if r["status"] == "OK":
-            eff = r["val_acc"] / max(r["vram_gb"], 0.01)
+            val = r.get("val_corr", r.get("val_acc", 0))
+            eff = val / max(r["vram_gb"], 0.01)
             print(
                 f"{r['name']:<22} {'OK':<8} {r['trainable_m']:>7.1f}M "
-                f"{r['vram_gb']:>6.2f} GB {r['val_acc']:>7.2f}% "
+                f"{r['vram_gb']:>6.2f} GB {val:>7.2f}% "
                 f"{r['total_time_s']:>5.0f}s {eff:>7.1f}"
             )
             if "val_acc_mismatched" in r:

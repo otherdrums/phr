@@ -36,7 +36,7 @@ class TrainingConfig:
     head_lr: float = 1e-3
     betas: tuple = (0.9, 0.999)
     eps: float = 1e-8
-    weight_decay: float = 0.0
+    weight_decay: float = 0.01
     block_size: int = 256
 
     # ── LR schedule (fractions of total micro-batches) ──

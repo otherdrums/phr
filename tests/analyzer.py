@@ -47,7 +47,7 @@ class RunData:
 
 def _parse_dirname(dirname: str):
     """Parse {task}_{method}_seed{seed}_{commit}_{timestamp}"""
-    m = re.match(r'^(\w+)_(\w+)_seed(\d+)_([a-f0-9]+)_(\d{8}_\d{6})$', dirname)
+    m = re.match(r'^(\w+?)_(.+)_seed(\d+)_([a-f0-9]+)_(\d{8}_\d{6})$', dirname)
     if not m:
         return None, None, None, None, None
     task, method, seed_str, commit, timestamp = m.groups()
@@ -95,7 +95,9 @@ def load_runs(results_dir: Path) -> list[RunData]:
         # Derived metrics
         rd.acc_per_gb = rd.val_acc / max(rd.peak_vram_gb, 0.01)
         rd.acc_per_m_params = rd.val_acc / max(rd.trainable_params_m, 0.001)
-        _TRAIN_SAMPLES = {"sst2": 42190, "mnli": 392702}
+        _TRAIN_SAMPLES = {"sst2": 42190, "mnli": 392702,
+                         "cola": 8551, "mrpc": 3668, "qqp": 363846,
+                         "qnli": 104743, "rte": 2490, "wnli": 635, "stsb": 5749}
         rd.samples_per_sec = (_TRAIN_SAMPLES.get(rd.task, 42190) * rd.epochs) / max(rd.total_time_s, 1)
 
         # Load layer_stats for PackR runs
